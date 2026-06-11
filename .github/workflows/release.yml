@@ -1,0 +1,58 @@
+name: Release WordPress plugin
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "cortexwp-ai-connector/**"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read plugin version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(grep -E '^[[:space:]]+\* Version:' cortexwp-ai-connector/cortexwp-ai-connector.php | awk '{print $3}')"
+          if [[ -z "$VERSION" ]]; then
+            echo "Unable to read plugin version." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build plugin zip
+        shell: bash
+        run: |
+          perl -0pi -e "s/private const GITHUB_REPO = '';/private const GITHUB_REPO = '$ENV{GITHUB_REPOSITORY}';/" cortexwp-ai-connector/cortexwp-ai-connector.php
+          rm -f cortexwp-ai-connector.zip
+          zip -r cortexwp-ai-connector.zip cortexwp-ai-connector \
+            -x "*.git*" \
+            -x "*/node_modules/*" \
+            -x "*/.DS_Store"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" cortexwp-ai-connector.zip --clobber
+          else
+            gh release create "$TAG" cortexwp-ai-connector.zip \
+              --title "CortexWP Connector $VERSION" \
+              --notes "CortexWP Connector $VERSION"
+          fi

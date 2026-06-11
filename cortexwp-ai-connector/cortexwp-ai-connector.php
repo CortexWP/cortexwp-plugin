@@ -6,6 +6,7 @@
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
+ * Update URI: https://cortexwp.ai/cortexwp-ai-connector
  * Requires at least: 6.0
  * Requires PHP: 7.4
  */
@@ -20,6 +21,9 @@ final class CortexWP_AI_Connector {
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
     private const ROUTE_NAMESPACE = 'cortexwp-ai/v1';
     private const SNIPPET_DIR = 'cortexwp-snippets';
+    private const GITHUB_REPO = '';
+    private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
+    private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
 
     public static function boot(): void {
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
@@ -31,6 +35,8 @@ final class CortexWP_AI_Connector {
         add_action('wp_ajax_cortexwp_ai_regenerate_key', [__CLASS__, 'ajax_regenerate_key']);
         add_action('plugins_loaded', [__CLASS__, 'load_snippets'], 20);
         add_action('rest_api_init', [__CLASS__, 'register_routes']);
+        add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_for_plugin_update']);
+        add_filter('plugins_api', [__CLASS__, 'plugin_update_details'], 10, 3);
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
     }
 
@@ -53,6 +59,157 @@ final class CortexWP_AI_Connector {
 
     private static function new_key(): string {
         return 'cwp_' . bin2hex(random_bytes(32));
+    }
+
+    private static function plugin_version(): string {
+        if (!function_exists('get_file_data')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        $headers = get_file_data(__FILE__, ['Version' => 'Version'], 'plugin');
+        return (string) ($headers['Version'] ?: '0.0.0');
+    }
+
+    private static function github_repo(): string {
+        if (defined('CORTEXWP_AI_CONNECTOR_GITHUB_REPO')) {
+            return trim((string) CORTEXWP_AI_CONNECTOR_GITHUB_REPO);
+        }
+
+        return self::GITHUB_REPO;
+    }
+
+    private static function github_headers(): array {
+        $headers = [
+            'Accept' => 'application/vnd.github+json',
+            'User-Agent' => 'CortexWP-AI-Connector/' . self::plugin_version(),
+        ];
+
+        if (defined('CORTEXWP_AI_CONNECTOR_GITHUB_TOKEN') && CORTEXWP_AI_CONNECTOR_GITHUB_TOKEN) {
+            $headers['Authorization'] = 'Bearer ' . trim((string) CORTEXWP_AI_CONNECTOR_GITHUB_TOKEN);
+        }
+
+        return $headers;
+    }
+
+    private static function latest_github_release(bool $force = false): ?array {
+        $repo = self::github_repo();
+
+        if ($repo === '' || strpos($repo, '/') === false) {
+            return null;
+        }
+
+        if (!$force) {
+            $cached = get_site_transient(self::UPDATE_CACHE_KEY);
+            if (is_array($cached)) {
+                return $cached;
+            }
+        }
+
+        $repo_path = implode('/', array_map('rawurlencode', explode('/', $repo, 2)));
+        $response = wp_remote_get('https://api.github.com/repos/' . $repo_path . '/releases/latest', [
+            'headers' => self::github_headers(),
+            'timeout' => 12,
+        ]);
+
+        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+            return null;
+        }
+
+        $payload = json_decode((string) wp_remote_retrieve_body($response), true);
+        if (!is_array($payload) || !empty($payload['draft']) || !empty($payload['prerelease'])) {
+            return null;
+        }
+
+        $download_url = '';
+        foreach ((array) ($payload['assets'] ?? []) as $asset) {
+            if (($asset['name'] ?? '') === self::RELEASE_ASSET && !empty($asset['browser_download_url'])) {
+                $download_url = (string) $asset['browser_download_url'];
+                break;
+            }
+        }
+
+        if ($download_url === '') {
+            return null;
+        }
+
+        $release = [
+            'version' => ltrim((string) ($payload['tag_name'] ?? ''), 'vV'),
+            'name' => (string) ($payload['name'] ?? 'CortexWP Connector'),
+            'body' => (string) ($payload['body'] ?? ''),
+            'published_at' => (string) ($payload['published_at'] ?? ''),
+            'html_url' => (string) ($payload['html_url'] ?? 'https://github.com/' . $repo),
+            'download_url' => $download_url,
+        ];
+
+        if ($release['version'] === '') {
+            return null;
+        }
+
+        set_site_transient(self::UPDATE_CACHE_KEY, $release, 6 * HOUR_IN_SECONDS);
+
+        return $release;
+    }
+
+    public static function check_for_plugin_update($transient) {
+        if (!is_object($transient)) {
+            return $transient;
+        }
+
+        $release = self::latest_github_release();
+        $plugin_file = plugin_basename(__FILE__);
+
+        if (!$release || !version_compare($release['version'], self::plugin_version(), '>')) {
+            return $transient;
+        }
+
+        if (!isset($transient->response) || !is_array($transient->response)) {
+            $transient->response = [];
+        }
+
+        $transient->response[$plugin_file] = (object) [
+            'id' => self::github_repo(),
+            'slug' => dirname($plugin_file),
+            'plugin' => $plugin_file,
+            'new_version' => $release['version'],
+            'url' => $release['html_url'],
+            'package' => $release['download_url'],
+            'tested' => '6.8',
+            'requires' => '6.0',
+            'requires_php' => '7.4',
+        ];
+
+        return $transient;
+    }
+
+    public static function plugin_update_details($result, string $action, object $args) {
+        $plugin_file = plugin_basename(__FILE__);
+
+        if ($action !== 'plugin_information' || empty($args->slug) || $args->slug !== dirname($plugin_file)) {
+            return $result;
+        }
+
+        $release = self::latest_github_release(true);
+
+        if (!$release) {
+            return $result;
+        }
+
+        return (object) [
+            'name' => 'CortexWP Connector',
+            'slug' => dirname($plugin_file),
+            'version' => $release['version'],
+            'author' => '<a href="https://cortexwp.ai">CortexWP</a>',
+            'homepage' => 'https://cortexwp.ai',
+            'download_link' => $release['download_url'],
+            'last_updated' => $release['published_at'],
+            'requires' => '6.0',
+            'tested' => '6.8',
+            'requires_php' => '7.4',
+            'sections' => [
+                'description' => 'Securely connects a WordPress site to CortexWP.ai.',
+                'changelog' => $release['body'] !== '' ? nl2br(esc_html($release['body'])) : 'See the GitHub release for details.',
+            ],
+        ];
     }
 
     public static function admin_menu(): void {
@@ -90,7 +247,7 @@ final class CortexWP_AI_Connector {
             return;
         }
 
-        wp_register_style('cortexwp-ai-admin', false, [], '0.1.0');
+        wp_register_style('cortexwp-ai-admin', false, [], self::plugin_version());
         wp_enqueue_style('cortexwp-ai-admin');
         wp_add_inline_style('cortexwp-ai-admin', self::admin_css());
 
