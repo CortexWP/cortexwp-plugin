@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.0.5
+ * Version: 1.0.6
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -1159,7 +1159,9 @@ JS;
 
         $files = glob(trailingslashit($dir) . '*.php') ?: [];
         sort($files);
-        return array_values(array_filter($files, 'is_readable'));
+        return array_values(array_filter($files, static function (string $file): bool {
+            return is_readable($file) && !in_array(strtolower(basename($file)), ['index.php'], true);
+        }));
     }
 
     private static function list_snippets(): array {
@@ -1223,7 +1225,7 @@ JS;
         $title = trim($title) ?: ucwords(str_replace(['-', '_'], ' ', $slug));
         $enabled = array_key_exists('enabled', $options) ? (bool) $options['enabled'] : true;
         $source = sanitize_key((string) ($options['source'] ?? 'ai')) ?: 'ai';
-        $php = $code;
+        $php = self::normalize_snippet_php($code);
         $path = self::snippet_path($slug);
 
         if (!self::php_lint($php)) {
@@ -1243,6 +1245,16 @@ JS;
             'enabled' => $enabled,
             'path' => str_replace(trailingslashit(WP_CONTENT_DIR), 'wp-content/', $path),
         ];
+    }
+
+    private static function normalize_snippet_php(string $code): string {
+        $php = preg_replace('/^\xEF\xBB\xBF/', '', $code) ?? $code;
+
+        if (!preg_match('/^\s*<\?php\b/i', $php)) {
+            $php = "<?php\n" . $php;
+        }
+
+        return substr($php, -1) === "\n" ? $php : $php . "\n";
     }
 
     private static function toggle_snippet(string $name, bool $enabled) {
