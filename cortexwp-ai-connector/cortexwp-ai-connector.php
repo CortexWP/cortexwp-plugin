@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -1229,7 +1229,7 @@ JS;
         $title = trim($title) ?: ucwords(str_replace(['-', '_'], ' ', $slug));
         $enabled = array_key_exists('enabled', $options) ? (bool) $options['enabled'] : true;
         $source = sanitize_key((string) ($options['source'] ?? 'ai')) ?: 'ai';
-        $php = self::format_snippet_file($title, $code, $enabled, $source);
+        $php = $code;
         $path = self::snippet_path($slug);
 
         if (!self::php_lint($php)) {
