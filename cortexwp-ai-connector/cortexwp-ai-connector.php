@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -1097,11 +1097,53 @@ JS;
     private static function ensure_snippet_dir(): bool {
         $dir = self::snippet_dir();
 
-        if (is_dir($dir)) {
-            return is_writable($dir);
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            return false;
         }
 
-        return wp_mkdir_p($dir) && is_writable($dir);
+        if (!is_writable($dir)) {
+            return false;
+        }
+
+        self::write_snippet_directory_protection_files($dir);
+
+        return true;
+    }
+
+    private static function write_snippet_directory_protection_files(string $dir): void {
+        $files = [
+            '.htaccess' => implode("\n", [
+                'Options -Indexes',
+                '<IfModule mod_authz_core.c>',
+                'Require all denied',
+                '</IfModule>',
+                '<IfModule !mod_authz_core.c>',
+                'Deny from all',
+                '</IfModule>',
+                '',
+            ]),
+            'index.php' => "<?php\nexit;\n",
+            'web.config' => implode("\n", [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                '<configuration>',
+                '  <system.webServer>',
+                '    <security>',
+                '      <authorization>',
+                '        <add accessType="Deny" users="*" />',
+                '      </authorization>',
+                '    </security>',
+                '  </system.webServer>',
+                '</configuration>',
+                '',
+            ]),
+        ];
+
+        foreach ($files as $name => $contents) {
+            $path = trailingslashit($dir) . $name;
+            if (!is_file($path) || is_writable($path)) {
+                file_put_contents($path, $contents);
+            }
+        }
     }
 
     private static function snippet_slug(string $name): string {
