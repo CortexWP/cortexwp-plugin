@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.0.4
+ * Version: 1.0.5
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -1181,7 +1181,7 @@ JS;
             'title' => $meta['title'] ?: ucwords(str_replace(['-', '_'], ' ', $slug)),
             'enabled' => $meta['enabled'] !== 'no',
             'source' => $meta['source'] ?: 'unknown',
-            'code' => self::strip_snippet_header($contents),
+            'code' => $contents,
             'file' => str_replace(trailingslashit(WP_CONTENT_DIR), 'wp-content/', $file),
             'modified' => gmdate('c', filemtime($file) ?: time()),
         ];
@@ -1206,12 +1206,6 @@ JS;
         }
 
         return $metadata;
-    }
-
-    private static function strip_snippet_header(string $contents): string {
-        $contents = preg_replace('/^<\\?php\\s*\\/\\*\\*.*?\\*\\/\\s*/s', "<?php\n", $contents) ?? $contents;
-        $contents = preg_replace('/if\\s*\\(\\s*!\\s*defined\\(\\s*[\'"]ABSPATH[\'"]\\s*\\)\\s*\\)\\s*\\{\\s*exit;?\\s*\\}\\s*/', '', $contents) ?? $contents;
-        return trim($contents) ?: "<?php\n";
     }
 
     private static function save_snippet(string $title, string $code, array $options = []) {
@@ -1279,22 +1273,6 @@ JS;
         }
 
         return ['deleted' => true, 'slug' => $slug];
-    }
-
-    private static function format_snippet_file(string $title, string $code, bool $enabled, string $source): string {
-        $body = trim($code);
-        $body = strpos($body, '<?php') === 0 ? preg_replace('/^<\\?php\\s*/', '', $body, 1) : $body;
-        $body = trim((string) $body);
-
-        return "<?php\n" .
-            "/**\n" .
-            " * CortexWP Snippet: " . str_replace(["\r", "\n"], ' ', $title) . "\n" .
-            " * CortexWP Enabled: " . ($enabled ? 'yes' : 'no') . "\n" .
-            " * CortexWP Source: " . $source . "\n" .
-            " * CortexWP Updated: " . gmdate('c') . "\n" .
-            " */\n" .
-            "if (!defined('ABSPATH')) { exit; }\n\n" .
-            $body . "\n";
     }
 
     private static function php_lint(string $php): bool {
