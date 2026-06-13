@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -21,7 +21,6 @@ final class CortexWP_AI_Connector {
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
     private const ROUTE_NAMESPACE = 'cortexwp-ai/v1';
     private const SNIPPET_DIR = 'cortexwp-snippets';
-    private const GITHUB_REPO = '';
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
 
@@ -71,11 +70,7 @@ final class CortexWP_AI_Connector {
     }
 
     private static function github_repo(): string {
-        if (defined('CORTEXWP_AI_CONNECTOR_GITHUB_REPO')) {
-            return trim((string) CORTEXWP_AI_CONNECTOR_GITHUB_REPO);
-        }
-
-        return self::GITHUB_REPO;
+        return 'CortexWP/cortexwp-plugin';
     }
 
     private static function github_headers(): array {
