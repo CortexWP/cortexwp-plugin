@@ -1117,7 +1117,7 @@ JS;
                 '</IfModule>',
                 '',
             ]),
-            'index.php' => "<?php\nexit;\n",
+            'index.php' => "<?php\n//Silence is good\n",
             'web.config' => implode("\n", [
                 '<?xml version="1.0" encoding="UTF-8"?>',
                 '<configuration>',
