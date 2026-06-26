@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.0.6
+ * Version: 1.1
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -1009,7 +1009,6 @@ JS;
             'key_domain' => self::key_domain(),
             'wordpress_path' => ABSPATH,
             'connection_method' => 'plugin',
-            'webserver_user' => self::webserver_user(),
             'capabilities' => self::capabilities(),
             'sftp' => null,
         ]);
@@ -1069,15 +1068,6 @@ JS;
                 require_once $file;
             }
         }
-    }
-
-    private static function webserver_user(): string {
-        if (function_exists('posix_getpwuid') && function_exists('posix_geteuid')) {
-            $user = posix_getpwuid(posix_geteuid());
-            return is_array($user) ? (string) ($user['name'] ?? '') : '';
-        }
-
-        return get_current_user();
     }
 
     private static function current_domain(): string {
