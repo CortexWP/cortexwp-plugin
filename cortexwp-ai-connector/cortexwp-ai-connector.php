@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.1
+ * Version: 1.2
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -23,8 +23,12 @@ final class CortexWP_AI_Connector {
     private const SNIPPET_DIR = 'cortexwp-snippets';
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
+    private const DEFAULT_APP_URL = 'http://127.0.0.1:3000';
+    private const FATAL_ERROR_ENDPOINT_PATH = '/api/wordpress/fatal-error';
+    private static $reserved_memory = '';
 
     public static function boot(): void {
+        self::$reserved_memory = str_repeat('x', 262144);
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
         add_action('admin_enqueue_scripts', [__CLASS__, 'admin_assets']);
         add_action('admin_post_cortexwp_ai_save', [__CLASS__, 'save_settings']);
@@ -36,6 +40,7 @@ final class CortexWP_AI_Connector {
         add_action('rest_api_init', [__CLASS__, 'register_routes']);
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_for_plugin_update']);
         add_filter('plugins_api', [__CLASS__, 'plugin_update_details'], 10, 3);
+        register_shutdown_function([__CLASS__, 'capture_fatal_error']);
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
     }
 
@@ -50,6 +55,7 @@ final class CortexWP_AI_Connector {
         if (!get_option(self::OPTION_SETTINGS)) {
             update_option(self::OPTION_SETTINGS, [
                 'connection_method' => 'plugin',
+                'app_url' => self::cortexwp_app_url(),
             ], false);
         }
 
@@ -84,6 +90,325 @@ final class CortexWP_AI_Connector {
         }
 
         return $headers;
+    }
+
+    private static function connector_settings(): array {
+        $settings = get_option(self::OPTION_SETTINGS, []);
+        return is_array($settings) ? $settings : [];
+    }
+
+    private static function cortexwp_app_url(): string {
+        if (defined('CORTEXWP_AI_CONNECTOR_APP_URL') && CORTEXWP_AI_CONNECTOR_APP_URL) {
+            return rtrim((string) CORTEXWP_AI_CONNECTOR_APP_URL, '/');
+        }
+
+        $settings = self::connector_settings();
+        $app_url = isset($settings['app_url']) ? trim((string) $settings['app_url']) : '';
+
+        return rtrim($app_url ?: self::DEFAULT_APP_URL, '/');
+    }
+
+    private static function fatal_error_endpoint(): string {
+        return self::cortexwp_app_url() . self::FATAL_ERROR_ENDPOINT_PATH;
+    }
+
+    public static function capture_fatal_error(): void {
+        self::$reserved_memory = '';
+
+        $error = error_get_last();
+        if (!is_array($error) || !self::should_report_error($error)) {
+            return;
+        }
+
+        self::send_fatal_error(self::fatal_error_payload($error));
+    }
+
+    private static function should_report_error(array $error): bool {
+        $type = (int) ($error['type'] ?? 0);
+
+        return in_array($type, self::fatal_error_types(), true);
+    }
+
+    private static function fatal_error_types(): array {
+        $types = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR];
+
+        if (defined('E_RECOVERABLE_ERROR')) {
+            $types[] = E_RECOVERABLE_ERROR;
+        }
+
+        return array_values(array_unique(array_map('intval', $types)));
+    }
+
+    private static function error_type_label(int $type): string {
+        $labels = [
+            E_ERROR => 'E_ERROR',
+            E_PARSE => 'E_PARSE',
+            E_CORE_ERROR => 'E_CORE_ERROR',
+            E_COMPILE_ERROR => 'E_COMPILE_ERROR',
+            E_USER_ERROR => 'E_USER_ERROR',
+        ];
+
+        if (defined('E_RECOVERABLE_ERROR')) {
+            $labels[E_RECOVERABLE_ERROR] = 'E_RECOVERABLE_ERROR';
+        }
+
+        return $labels[$type] ?? 'E_FATAL';
+    }
+
+    private static function send_fatal_error(array $payload): void {
+        if (!function_exists('wp_remote_post')) {
+            return;
+        }
+
+        $body = wp_json_encode($payload);
+        if (!is_string($body) || $body === '') {
+            return;
+        }
+
+        $timestamp = (string) time();
+        $nonce = bin2hex(random_bytes(16));
+        $domain = self::key_domain();
+
+        wp_remote_post(self::fatal_error_endpoint(), [
+            'blocking' => true,
+            'body' => $body,
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'User-Agent' => 'CortexWP-AI-Connector/' . self::plugin_version(),
+                'X-CortexWP-Domain' => $domain,
+                'X-CortexWP-Nonce' => $nonce,
+                'X-CortexWP-Signature' => self::fatal_error_signature($body, $timestamp, $nonce, $domain),
+                'X-CortexWP-Timestamp' => $timestamp,
+            ],
+            'redirection' => 0,
+            'timeout' => 3,
+        ]);
+    }
+
+    private static function fatal_error_signature(string $body, string $timestamp, string $nonce, string $domain): string {
+        $payload = implode("\n", [
+            'POST',
+            self::FATAL_ERROR_ENDPOINT_PATH,
+            hash('sha256', $body),
+            $timestamp,
+            $nonce,
+            $domain,
+        ]);
+
+        return hash_hmac('sha256', $payload, self::connector_key());
+    }
+
+    private static function fatal_error_payload(array $error): array {
+        $type = (int) ($error['type'] ?? 0);
+        $message = self::truncate_text((string) ($error['message'] ?? ''), 10000);
+        $file = isset($error['file']) ? self::public_path((string) $error['file']) : '';
+        $line = isset($error['line']) ? (int) $error['line'] : 0;
+        $request_url = self::request_url();
+        $component = self::component_from_file((string) ($error['file'] ?? ''));
+
+        return [
+            'componentName' => $component['name'],
+            'componentSlug' => $component['slug'],
+            'componentType' => $component['type'],
+            'errorType' => $type,
+            'errorTypeLabel' => self::error_type_label($type),
+            'file' => $file ?: null,
+            'fingerprint' => hash('sha256', implode('|', [$type, $message, $file, $line, $request_url])),
+            'ipHash' => self::client_ip_hash(),
+            'line' => $line ?: null,
+            'message' => $message ?: 'Fatal error',
+            'occurredAt' => gmdate('c'),
+            'referer' => self::safe_server_value('HTTP_REFERER', 2000),
+            'requestContext' => self::request_context(),
+            'requestMethod' => self::safe_server_value('REQUEST_METHOD', 20),
+            'requestUrl' => $request_url,
+            'siteDomain' => self::key_domain(),
+            'siteUrl' => home_url(),
+            'stackTrace' => self::stack_trace_from_message($message),
+            'userAgent' => self::safe_server_value('HTTP_USER_AGENT', 1000),
+            'wpUser' => self::current_wp_user_context(),
+        ];
+    }
+
+    private static function request_url(): string {
+        $host = self::safe_server_value('HTTP_HOST', 255);
+        $uri = self::safe_server_value('REQUEST_URI', 2500);
+
+        if (!$host) {
+            return home_url($uri ?: '/');
+        }
+
+        $scheme = is_ssl() ? 'https' : 'http';
+        return self::truncate_text($scheme . '://' . $host . ($uri ?: '/'), 3000);
+    }
+
+    private static function request_context(): array {
+        $context = [
+            'adminPage' => isset($GLOBALS['pagenow']) ? sanitize_key((string) $GLOBALS['pagenow']) : null,
+            'adminScreen' => null,
+            'ajaxAction' => isset($_REQUEST['action']) ? sanitize_key((string) wp_unslash($_REQUEST['action'])) : null,
+            'doingAjax' => function_exists('wp_doing_ajax') ? wp_doing_ajax() : (defined('DOING_AJAX') && DOING_AJAX),
+            'doingCron' => function_exists('wp_doing_cron') ? wp_doing_cron() : (defined('DOING_CRON') && DOING_CRON),
+            'isAdmin' => is_admin(),
+            'queryKeys' => self::request_keys($_GET),
+            'postKeys' => self::request_keys($_POST),
+            'restRoute' => defined('REST_REQUEST') && REST_REQUEST ? self::safe_server_value('REQUEST_URI', 2500) : null,
+            'wpCli' => defined('WP_CLI') && WP_CLI,
+        ];
+
+        if (function_exists('get_current_screen')) {
+            $screen = get_current_screen();
+            if ($screen && isset($screen->id)) {
+                $context['adminScreen'] = sanitize_key((string) $screen->id);
+            }
+        }
+
+        return array_filter($context, static fn($value) => $value !== null && $value !== '');
+    }
+
+    private static function request_keys(array $values): array {
+        $keys = array_map('sanitize_key', array_keys($values));
+        return array_slice(array_values(array_filter($keys)), 0, 40);
+    }
+
+    private static function current_wp_user_context(): ?array {
+        if (!function_exists('wp_get_current_user')) {
+            return null;
+        }
+
+        $user = wp_get_current_user();
+        if (!$user || empty($user->ID)) {
+            return null;
+        }
+
+        return [
+            'email' => self::truncate_text((string) $user->user_email, 320),
+            'id' => (int) $user->ID,
+            'login' => self::truncate_text((string) $user->user_login, 120),
+            'roles' => array_values(array_map('sanitize_key', (array) $user->roles)),
+        ];
+    }
+
+    private static function client_ip_hash(): ?string {
+        $ip = self::safe_server_value('REMOTE_ADDR', 128);
+        if (!$ip) {
+            return null;
+        }
+
+        return hash_hmac('sha256', $ip, self::connector_key());
+    }
+
+    private static function component_from_file(string $file): array {
+        $normalized = wp_normalize_path($file);
+        $plugin_dir = defined('WP_PLUGIN_DIR') ? trailingslashit(wp_normalize_path(WP_PLUGIN_DIR)) : '';
+        $mu_plugin_dir = defined('WPMU_PLUGIN_DIR') ? trailingslashit(wp_normalize_path(WPMU_PLUGIN_DIR)) : '';
+        $theme_dir = trailingslashit(wp_normalize_path(get_theme_root()));
+        $content_dir = trailingslashit(wp_normalize_path(WP_CONTENT_DIR));
+        $abspath = trailingslashit(wp_normalize_path(ABSPATH));
+
+        if ($plugin_dir && strpos($normalized, $plugin_dir) === 0) {
+            $slug = strtok(substr($normalized, strlen($plugin_dir)), '/\\') ?: '';
+            return [
+                'name' => self::plugin_name_from_slug($slug),
+                'slug' => $slug,
+                'type' => 'plugin',
+            ];
+        }
+
+        if ($mu_plugin_dir && strpos($normalized, $mu_plugin_dir) === 0) {
+            $relative = substr($normalized, strlen($mu_plugin_dir));
+            $slug = strtok($relative, '/\\') ?: basename($relative);
+            return [
+                'name' => $slug ?: 'MU plugin',
+                'slug' => $slug,
+                'type' => 'mu-plugin',
+            ];
+        }
+
+        if ($theme_dir && strpos($normalized, $theme_dir) === 0) {
+            $slug = strtok(substr($normalized, strlen($theme_dir)), '/\\') ?: '';
+            $theme = $slug ? wp_get_theme($slug) : null;
+            return [
+                'name' => $theme && $theme->exists() ? $theme->get('Name') : ($slug ?: 'Theme'),
+                'slug' => $slug,
+                'type' => 'theme',
+            ];
+        }
+
+        if ($content_dir && strpos($normalized, $content_dir) === 0) {
+            return [
+                'name' => 'wp-content',
+                'slug' => 'wp-content',
+                'type' => 'unknown',
+            ];
+        }
+
+        if ($abspath && strpos($normalized, $abspath) === 0) {
+            return [
+                'name' => 'WordPress core',
+                'slug' => 'wordpress-core',
+                'type' => 'core',
+            ];
+        }
+
+        return [
+            'name' => 'Unknown source',
+            'slug' => '',
+            'type' => 'unknown',
+        ];
+    }
+
+    private static function plugin_name_from_slug(string $slug): string {
+        if (!$slug) {
+            return 'Plugin';
+        }
+
+        if (!function_exists('get_plugins')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        foreach (get_plugins() as $plugin_file => $plugin_data) {
+            if (strtok($plugin_file, '/\\') === $slug) {
+                return (string) ($plugin_data['Name'] ?? $slug);
+            }
+        }
+
+        return $slug;
+    }
+
+    private static function public_path(string $path): string {
+        $normalized = wp_normalize_path($path);
+        $abspath = trailingslashit(wp_normalize_path(ABSPATH));
+
+        if ($abspath && strpos($normalized, $abspath) === 0) {
+            return '/' . ltrim(substr($normalized, strlen($abspath)), '/');
+        }
+
+        return $normalized;
+    }
+
+    private static function stack_trace_from_message(string $message): ?string {
+        if (preg_match('/Stack trace:\s*(.+)$/s', $message, $matches)) {
+            return self::truncate_text(trim($matches[1]), 50000);
+        }
+
+        return null;
+    }
+
+    private static function safe_server_value(string $key, int $max_length): string {
+        if (!isset($_SERVER[$key])) {
+            return '';
+        }
+
+        return self::truncate_text(sanitize_text_field(wp_unslash((string) $_SERVER[$key])), $max_length);
+    }
+
+    private static function truncate_text(string $value, int $max_length): string {
+        if (function_exists('mb_substr')) {
+            return mb_substr($value, 0, $max_length);
+        }
+
+        return substr($value, 0, $max_length);
     }
 
     private static function latest_github_release(bool $force = false): ?array {
@@ -860,9 +1185,9 @@ JS;
             update_option(self::OPTION_KEY_DOMAIN, self::current_domain(), false);
         }
 
-        update_option(self::OPTION_SETTINGS, [
+        update_option(self::OPTION_SETTINGS, array_merge(self::connector_settings(), [
             'connection_method' => 'plugin',
-        ], false);
+        ]), false);
 
         wp_safe_redirect(admin_url('admin.php?page=cortexwp-ai&updated=1'));
         exit;
@@ -880,9 +1205,9 @@ JS;
 
         self::store_key($key);
         update_option(self::OPTION_KEY_DOMAIN, $domain, false);
-        update_option(self::OPTION_SETTINGS, [
+        update_option(self::OPTION_SETTINGS, array_merge(self::connector_settings(), [
             'connection_method' => 'plugin',
-        ], false);
+        ]), false);
 
         wp_send_json_success([
             'key' => $key,
@@ -1003,12 +1328,18 @@ JS;
     }
 
     public static function status(WP_REST_Request $request): WP_REST_Response {
+        $params = $request->get_json_params();
+        if (is_array($params) && !empty($params['app_url'])) {
+            self::save_app_url((string) $params['app_url']);
+        }
+
         return rest_ensure_response([
             'site_url' => site_url(),
             'home_url' => home_url(),
             'key_domain' => self::key_domain(),
             'wordpress_path' => ABSPATH,
             'connection_method' => 'plugin',
+            'fatal_error_endpoint' => self::fatal_error_endpoint(),
             'capabilities' => self::capabilities(),
             'sftp' => null,
         ]);
@@ -1057,8 +1388,23 @@ JS;
             'can_write_mu_plugins' => is_dir(WPMU_PLUGIN_DIR) ? is_writable(WPMU_PLUGIN_DIR) : is_writable(WP_CONTENT_DIR),
             'can_write_cortexwp_snippets' => self::ensure_snippet_dir(),
             'exec_available' => self::exec_available(),
-            'wp_cli_available' => self::exec_available() && trim((string) shell_exec('command -v wp 2>/dev/null')) !== '',
+            'native_management_available' => true,
+            'fatal_error_monitor' => true,
+            'fatal_error_endpoint' => self::fatal_error_endpoint(),
+            'wp_cli_available' => self::wp_cli_available(),
         ];
+    }
+
+    private static function save_app_url(string $value): void {
+        $url = esc_url_raw(trim($value));
+        if (!$url || !preg_match('/^https?:\/\//i', $url)) {
+            return;
+        }
+
+        update_option(self::OPTION_SETTINGS, array_merge(self::connector_settings(), [
+            'app_url' => rtrim($url, '/'),
+            'connection_method' => 'plugin',
+        ]), false);
     }
 
     public static function load_snippets(): void {
@@ -1383,6 +1729,814 @@ JS;
         return function_exists('shell_exec') && function_exists('proc_open') && !in_array('shell_exec', $disabled, true) && !in_array('proc_open', $disabled, true);
     }
 
+    private static function wp_cli_available(): bool {
+        if (!self::exec_available()) {
+            return false;
+        }
+
+        return trim((string) shell_exec('command -v wp 2>/dev/null')) !== '';
+    }
+
+    private static function native_command(array $args): string {
+        return 'wp ' . implode(' ', array_map(static fn($arg) => (string) $arg, $args)) . ' --path=' . ABSPATH;
+    }
+
+    private static function native_result(array $args, string $stdout = '', string $stderr = '', int $exit_code = 0, int $max_output_bytes = 500000): array {
+        return [
+            'command' => self::native_command($args),
+            'cwd' => ABSPATH,
+            'exit_code' => $exit_code,
+            'stdout' => self::truncate($stdout, $max_output_bytes),
+            'stderr' => self::truncate($stderr, $max_output_bytes),
+            'timed_out' => false,
+            'runner' => 'wordpress-native',
+        ];
+    }
+
+    private static function native_json_result(array $args, $value, int $max_output_bytes = 500000): array {
+        return self::native_result($args, (string) wp_json_encode($value), '', 0, $max_output_bytes);
+    }
+
+    private static function native_error_result(array $args, string $message, int $max_output_bytes = 500000): array {
+        return self::native_result($args, '', $message, 1, $max_output_bytes);
+    }
+
+    private static function load_update_functions(): void {
+        if (!function_exists('get_plugins')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        if (!function_exists('get_plugin_updates')) {
+            require_once ABSPATH . 'wp-admin/includes/update.php';
+        }
+
+        if (!function_exists('request_filesystem_credentials')) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+    }
+
+    private static function load_upgrader_functions(): void {
+        self::load_update_functions();
+
+        if (!class_exists('WP_Upgrader')) {
+            require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+        }
+
+        if (!function_exists('plugins_api')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+        }
+
+        if (!function_exists('themes_api')) {
+            require_once ABSPATH . 'wp-admin/includes/theme.php';
+        }
+    }
+
+    private static function plugin_slug_from_file(string $file): string {
+        return strpos($file, '/') !== false ? dirname($file) : preg_replace('/\.php$/i', '', basename($file));
+    }
+
+    private static function plugin_candidates(bool $include_special = true): array {
+        self::load_update_functions();
+
+        $items = [];
+
+        foreach (get_plugins() as $file => $data) {
+            $items[] = [
+                'name' => self::plugin_slug_from_file((string) $file),
+                'title' => (string) ($data['Name'] ?? $file),
+                'plugin_file' => (string) $file,
+                'version' => (string) ($data['Version'] ?? ''),
+                'kind' => 'plugin',
+                'path' => trailingslashit(WP_PLUGIN_DIR) . $file,
+            ];
+        }
+
+        if ($include_special) {
+            foreach (get_mu_plugins() as $file => $data) {
+                $items[] = [
+                    'name' => self::plugin_slug_from_file((string) $file),
+                    'title' => (string) ($data['Name'] ?? $file),
+                    'plugin_file' => (string) $file,
+                    'version' => (string) ($data['Version'] ?? ''),
+                    'kind' => 'mu-plugin',
+                    'path' => trailingslashit(WPMU_PLUGIN_DIR) . $file,
+                ];
+            }
+
+            foreach (get_dropins() as $file => $data) {
+                $title = is_array($data) ? (string) ($data['Name'] ?? $file) : (string) ($data ?: $file);
+                $items[] = [
+                    'name' => self::plugin_slug_from_file((string) $file),
+                    'title' => $title,
+                    'plugin_file' => (string) $file,
+                    'version' => is_array($data) ? (string) ($data['Version'] ?? '') : '',
+                    'kind' => 'dropin',
+                    'path' => trailingslashit(WP_CONTENT_DIR) . $file,
+                ];
+            }
+        }
+
+        return $items;
+    }
+
+    private static function resolve_plugin_target(string $target, bool $include_special = false): ?array {
+        $needle = strtolower(trim($target));
+        if ($needle === '') {
+            return null;
+        }
+
+        foreach (self::plugin_candidates($include_special) as $plugin) {
+            $file = (string) $plugin['plugin_file'];
+            $path = (string) $plugin['path'];
+            $aliases = array_filter([
+                $plugin['name'],
+                $plugin['title'],
+                $file,
+                preg_replace('/\.php$/i', '', $file),
+                strtok($file, '/'),
+                basename($file),
+                preg_replace('/\.php$/i', '', basename($file)),
+                $path,
+            ]);
+
+            foreach ($aliases as $alias) {
+                if (strtolower((string) $alias) === $needle) {
+                    return $plugin;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static function plugin_updates(): array {
+        self::load_update_functions();
+        wp_update_plugins();
+        $transient = get_site_transient('update_plugins');
+
+        return is_object($transient) && isset($transient->response) && is_array($transient->response)
+            ? $transient->response
+            : [];
+    }
+
+    private static function native_plugin_metadata(array $args, int $max_output_bytes): array {
+        $items = array_map(static function (array $plugin): array {
+            return [
+                'name' => $plugin['name'],
+                'title' => $plugin['title'],
+                'plugin_file' => $plugin['plugin_file'],
+                'kind' => $plugin['kind'],
+            ];
+        }, self::plugin_candidates(true));
+
+        return self::native_json_result($args, $items, $max_output_bytes);
+    }
+
+    private static function native_plugin_list(array $args, int $max_output_bytes): array {
+        $updates = self::plugin_updates();
+        $auto_updates = get_site_option('auto_update_plugins', []);
+        $auto_updates = is_array($auto_updates) ? $auto_updates : [];
+
+        $items = [];
+        foreach (self::plugin_candidates(true) as $plugin) {
+            $file = (string) $plugin['plugin_file'];
+            $kind = (string) $plugin['kind'];
+            $update = $kind === 'plugin' && isset($updates[$file]) ? $updates[$file] : null;
+
+            if ($kind === 'mu-plugin') {
+                $status = 'must-use';
+            } elseif ($kind === 'dropin') {
+                $status = 'dropin';
+            } elseif (is_plugin_active_for_network($file)) {
+                $status = 'active-network';
+            } elseif (is_plugin_active($file)) {
+                $status = 'active';
+            } else {
+                $status = 'inactive';
+            }
+
+            $items[] = [
+                'name' => $plugin['name'],
+                'status' => $status,
+                'version' => $plugin['version'] ?: 'unknown',
+                'update' => $update ? 'available' : 'none',
+                'update_version' => $update && isset($update->new_version) ? (string) $update->new_version : '',
+                'auto_update' => in_array($file, $auto_updates, true) ? 'on' : 'off',
+            ];
+        }
+
+        return self::native_json_result($args, $items, $max_output_bytes);
+    }
+
+    private static function theme_updates(): array {
+        self::load_update_functions();
+        wp_update_themes();
+        $transient = get_site_transient('update_themes');
+
+        return is_object($transient) && isset($transient->response) && is_array($transient->response)
+            ? $transient->response
+            : [];
+    }
+
+    private static function native_theme_metadata(array $args, int $max_output_bytes): array {
+        $items = [];
+        foreach (wp_get_themes() as $slug => $theme) {
+            $items[] = [
+                'name' => (string) $slug,
+                'title' => (string) $theme->get('Name'),
+            ];
+        }
+
+        return self::native_json_result($args, $items, $max_output_bytes);
+    }
+
+    private static function native_theme_list(array $args, int $max_output_bytes): array {
+        $updates = self::theme_updates();
+        $auto_updates = get_site_option('auto_update_themes', []);
+        $auto_updates = is_array($auto_updates) ? $auto_updates : [];
+        $active = get_stylesheet();
+        $items = [];
+
+        foreach (wp_get_themes() as $slug => $theme) {
+            $update = isset($updates[$slug]) ? $updates[$slug] : null;
+            $items[] = [
+                'name' => (string) $slug,
+                'status' => (string) $slug === $active ? 'active' : 'inactive',
+                'version' => (string) $theme->get('Version') ?: 'unknown',
+                'update' => $update ? 'available' : 'none',
+                'update_version' => is_array($update) && isset($update['new_version']) ? (string) $update['new_version'] : '',
+                'auto_update' => in_array((string) $slug, $auto_updates, true) ? 'on' : 'off',
+            ];
+        }
+
+        return self::native_json_result($args, $items, $max_output_bytes);
+    }
+
+    private static function native_core_updates(): array {
+        self::load_update_functions();
+        wp_version_check([], true);
+        $updates = get_core_updates();
+        $items = [];
+
+        foreach (is_array($updates) ? $updates : [] as $update) {
+            if (!is_object($update)) {
+                continue;
+            }
+
+            $response = (string) ($update->response ?? '');
+            if ($response === '' || $response === 'latest') {
+                continue;
+            }
+
+            $items[] = [
+                'version' => (string) ($update->current ?? $update->version ?? ''),
+                'update_type' => (string) ($update->update_type ?? ''),
+                'package_url' => (string) ($update->download ?? ''),
+                'locale' => (string) ($update->locale ?? get_locale()),
+                'response' => $response,
+            ];
+        }
+
+        return $items;
+    }
+
+    private static function upgrader_error_message($result, string $fallback): string {
+        if (is_wp_error($result)) {
+            return $result->get_error_message();
+        }
+
+        if ($result === false || $result === null) {
+            return $fallback;
+        }
+
+        return '';
+    }
+
+    private static function native_core_update(array $args, int $max_output_bytes): array {
+        self::load_upgrader_functions();
+        $updates = self::native_core_updates();
+
+        if (!$updates) {
+            return self::native_result($args, 'WordPress is already up to date.', '', 0, $max_output_bytes);
+        }
+
+        $core_updates = get_core_updates();
+        $selected = null;
+        foreach (is_array($core_updates) ? $core_updates : [] as $update) {
+            if (is_object($update) && (string) ($update->response ?? '') !== 'latest') {
+                $selected = $update;
+                break;
+            }
+        }
+
+        if (!$selected) {
+            return self::native_result($args, 'WordPress is already up to date.', '', 0, $max_output_bytes);
+        }
+
+        $upgrader = new Core_Upgrader(new Automatic_Upgrader_Skin());
+        $result = $upgrader->upgrade($selected);
+        $error = self::upgrader_error_message($result, 'Unable to update WordPress core.');
+
+        if ($error) {
+            return self::native_error_result($args, $error, $max_output_bytes);
+        }
+
+        return self::native_result($args, 'WordPress core updated successfully.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_core_update_db(array $args, int $max_output_bytes): array {
+        if (!function_exists('wp_upgrade')) {
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        }
+
+        wp_upgrade();
+        return self::native_result($args, 'WordPress database checked successfully.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_plugin_update(array $args, int $max_output_bytes): array {
+        self::load_upgrader_functions();
+        $targets = array_values(array_filter(array_slice($args, 2), static fn($arg) => strpos((string) $arg, '--') !== 0));
+        $all = in_array('--all', $args, true);
+        $updates = self::plugin_updates();
+        $files = [];
+
+        if ($all) {
+            $files = array_keys($updates);
+        } else {
+            foreach ($targets as $target) {
+                $plugin = self::resolve_plugin_target((string) $target, false);
+                if (!$plugin) {
+                    return self::native_error_result($args, 'Plugin not found: ' . (string) $target, $max_output_bytes);
+                }
+
+                $file = (string) $plugin['plugin_file'];
+                if (isset($updates[$file])) {
+                    $files[] = $file;
+                }
+            }
+        }
+
+        $files = array_values(array_unique($files));
+        if (!$files) {
+            return self::native_json_result($args, [], $max_output_bytes);
+        }
+
+        $before = [];
+        $active_before = [];
+        $network_active_before = [];
+        foreach (self::plugin_candidates(false) as $plugin) {
+            $file = (string) $plugin['plugin_file'];
+            $before[$file] = $plugin;
+            $active_before[$file] = is_plugin_active($file);
+            $network_active_before[$file] = is_plugin_active_for_network($file);
+        }
+
+        $upgrader = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
+        $result = count($files) === 1 ? [$files[0] => $upgrader->upgrade($files[0])] : $upgrader->bulk_upgrade($files);
+        $error = self::upgrader_error_message($result, 'Unable to update plugin.');
+
+        if ($error) {
+            return self::native_error_result($args, $error, $max_output_bytes);
+        }
+
+        wp_clean_plugins_cache(false);
+
+        foreach ($files as $file) {
+            if (empty($active_before[$file]) && empty($network_active_before[$file])) {
+                continue;
+            }
+
+            if (!file_exists(trailingslashit(WP_PLUGIN_DIR) . $file)) {
+                return self::native_error_result($args, 'Plugin updated, but the plugin file is missing after update: ' . $file, $max_output_bytes);
+            }
+
+            $reactivated = activate_plugin($file, '', !empty($network_active_before[$file]), true);
+            if (is_wp_error($reactivated)) {
+                return self::native_error_result($args, 'Plugin updated, but CortexWP could not restore its active state: ' . $reactivated->get_error_message(), $max_output_bytes);
+            }
+        }
+
+        $after = [];
+        foreach (self::plugin_candidates(false) as $plugin) {
+            $after[(string) $plugin['plugin_file']] = $plugin;
+        }
+
+        $rows = [];
+        foreach ($files as $file) {
+            $rows[] = [
+                'name' => isset($before[$file]) ? $before[$file]['name'] : self::plugin_slug_from_file($file),
+                'old_version' => isset($before[$file]) ? $before[$file]['version'] : '',
+                'new_version' => isset($after[$file]) ? $after[$file]['version'] : '',
+                'status' => 'Updated',
+            ];
+        }
+
+        return self::native_json_result($args, $rows, $max_output_bytes);
+    }
+
+    private static function native_plugin_activate(array $args, int $max_output_bytes): array {
+        $target = (string) ($args[2] ?? '');
+        $plugin = self::resolve_plugin_target($target, false);
+
+        if (!$plugin) {
+            return self::native_error_result($args, 'Plugin not found: ' . $target, $max_output_bytes);
+        }
+
+        $result = activate_plugin((string) $plugin['plugin_file']);
+        if (is_wp_error($result)) {
+            return self::native_error_result($args, $result->get_error_message(), $max_output_bytes);
+        }
+
+        return self::native_result($args, 'Plugin activated.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_plugin_deactivate(array $args, int $max_output_bytes): array {
+        $target = (string) ($args[2] ?? '');
+        $plugin = self::resolve_plugin_target($target, false);
+
+        if (!$plugin) {
+            return self::native_error_result($args, 'Plugin not found: ' . $target, $max_output_bytes);
+        }
+
+        deactivate_plugins((string) $plugin['plugin_file'], false, false);
+        return self::native_result($args, 'Plugin deactivated.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_plugin_delete(array $args, int $max_output_bytes): array {
+        $target = (string) ($args[2] ?? '');
+        $plugin = self::resolve_plugin_target($target, true);
+
+        if (!$plugin) {
+            return self::native_error_result($args, 'Plugin not found: ' . $target, $max_output_bytes);
+        }
+
+        if ($plugin['kind'] === 'plugin') {
+            deactivate_plugins((string) $plugin['plugin_file'], false, false);
+            $result = delete_plugins([(string) $plugin['plugin_file']]);
+            if (is_wp_error($result)) {
+                return self::native_error_result($args, $result->get_error_message(), $max_output_bytes);
+            }
+
+            return self::native_result($args, 'Plugin deleted.', '', 0, $max_output_bytes);
+        }
+
+        $path = (string) $plugin['path'];
+        if (!is_file($path) || !is_writable($path)) {
+            return self::native_error_result($args, 'The selected file is not writable.', $max_output_bytes);
+        }
+
+        if (!unlink($path)) {
+            return self::native_error_result($args, 'Unable to delete the selected file.', $max_output_bytes);
+        }
+
+        return self::native_json_result($args, [
+            'deleted' => true,
+            'kind' => $plugin['kind'],
+            'file' => $plugin['plugin_file'],
+        ], $max_output_bytes);
+    }
+
+    private static function native_plugin_install(array $args, int $max_output_bytes): array {
+        self::load_upgrader_functions();
+        $slug = sanitize_key((string) ($args[2] ?? ''));
+
+        if (!$slug) {
+            return self::native_error_result($args, 'Plugin slug is required.', $max_output_bytes);
+        }
+
+        $api = plugins_api('plugin_information', [
+            'slug' => $slug,
+            'fields' => ['sections' => false],
+        ]);
+
+        if (is_wp_error($api)) {
+            return self::native_error_result($args, $api->get_error_message(), $max_output_bytes);
+        }
+
+        $upgrader = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
+        $result = $upgrader->install($api->download_link);
+        $error = self::upgrader_error_message($result, 'Unable to install plugin.');
+
+        if ($error) {
+            return self::native_error_result($args, $error, $max_output_bytes);
+        }
+
+        wp_clean_plugins_cache(false);
+        return self::native_result($args, 'Plugin installed.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_plugin_auto_update(array $args, int $max_output_bytes): array {
+        $mode = (string) ($args[2] ?? '');
+        $target = (string) ($args[3] ?? '');
+        $plugin = self::resolve_plugin_target($target, false);
+
+        if (!$plugin) {
+            return self::native_error_result($args, 'Plugin not found: ' . $target, $max_output_bytes);
+        }
+
+        $file = (string) $plugin['plugin_file'];
+        $auto_updates = get_site_option('auto_update_plugins', []);
+        $auto_updates = is_array($auto_updates) ? $auto_updates : [];
+
+        if ($mode === 'enable') {
+            $auto_updates[] = $file;
+        } elseif ($mode === 'disable') {
+            $auto_updates = array_diff($auto_updates, [$file]);
+        } else {
+            return self::native_error_result($args, 'Auto-update mode must be enable or disable.', $max_output_bytes);
+        }
+
+        update_site_option('auto_update_plugins', array_values(array_unique($auto_updates)));
+        return self::native_result($args, 'Plugin auto-updates ' . ($mode === 'enable' ? 'enabled.' : 'disabled.'), '', 0, $max_output_bytes);
+    }
+
+    private static function native_theme_update(array $args, int $max_output_bytes): array {
+        self::load_upgrader_functions();
+        $targets = array_values(array_filter(array_slice($args, 2), static fn($arg) => strpos((string) $arg, '--') !== 0));
+        $all = in_array('--all', $args, true);
+        $updates = self::theme_updates();
+        $themes = $all ? array_keys($updates) : array_values(array_filter($targets, static fn($slug) => isset($updates[(string) $slug])));
+
+        if (!$themes) {
+            return self::native_json_result($args, [], $max_output_bytes);
+        }
+
+        $active_stylesheet = get_stylesheet();
+        $before = wp_get_themes();
+        $upgrader = new Theme_Upgrader(new Automatic_Upgrader_Skin());
+        $result = count($themes) === 1 ? [$themes[0] => $upgrader->upgrade($themes[0])] : $upgrader->bulk_upgrade($themes);
+        $error = self::upgrader_error_message($result, 'Unable to update theme.');
+
+        if ($error) {
+            return self::native_error_result($args, $error, $max_output_bytes);
+        }
+
+        wp_clean_themes_cache(false);
+
+        if (get_stylesheet() !== $active_stylesheet && wp_get_theme($active_stylesheet)->exists()) {
+            switch_theme($active_stylesheet);
+        }
+
+        $after = wp_get_themes();
+        $rows = [];
+
+        foreach ($themes as $slug) {
+            $rows[] = [
+                'name' => (string) $slug,
+                'old_version' => isset($before[$slug]) ? (string) $before[$slug]->get('Version') : '',
+                'new_version' => isset($after[$slug]) ? (string) $after[$slug]->get('Version') : '',
+                'status' => 'Updated',
+            ];
+        }
+
+        return self::native_json_result($args, $rows, $max_output_bytes);
+    }
+
+    private static function native_theme_activate(array $args, int $max_output_bytes): array {
+        $slug = sanitize_key((string) ($args[2] ?? ''));
+        if (!$slug || !wp_get_theme($slug)->exists()) {
+            return self::native_error_result($args, 'Theme not found: ' . $slug, $max_output_bytes);
+        }
+
+        switch_theme($slug);
+        return self::native_result($args, 'Theme activated.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_theme_delete(array $args, int $max_output_bytes): array {
+        $slug = sanitize_key((string) ($args[2] ?? ''));
+        if (!$slug || !wp_get_theme($slug)->exists()) {
+            return self::native_error_result($args, 'Theme not found: ' . $slug, $max_output_bytes);
+        }
+
+        if ($slug === get_stylesheet() || $slug === get_template()) {
+            return self::native_error_result($args, 'The active theme cannot be deleted.', $max_output_bytes);
+        }
+
+        self::load_update_functions();
+        $result = delete_theme($slug);
+        if (is_wp_error($result)) {
+            return self::native_error_result($args, $result->get_error_message(), $max_output_bytes);
+        }
+
+        return self::native_result($args, 'Theme deleted.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_theme_install(array $args, int $max_output_bytes): array {
+        self::load_upgrader_functions();
+        $slug = sanitize_key((string) ($args[2] ?? ''));
+
+        if (!$slug) {
+            return self::native_error_result($args, 'Theme slug is required.', $max_output_bytes);
+        }
+
+        $api = themes_api('theme_information', [
+            'slug' => $slug,
+            'fields' => ['sections' => false],
+        ]);
+
+        if (is_wp_error($api)) {
+            return self::native_error_result($args, $api->get_error_message(), $max_output_bytes);
+        }
+
+        $upgrader = new Theme_Upgrader(new Automatic_Upgrader_Skin());
+        $result = $upgrader->install($api->download_link);
+        $error = self::upgrader_error_message($result, 'Unable to install theme.');
+
+        if ($error) {
+            return self::native_error_result($args, $error, $max_output_bytes);
+        }
+
+        wp_clean_themes_cache(false);
+        return self::native_result($args, 'Theme installed.', '', 0, $max_output_bytes);
+    }
+
+    private static function native_theme_auto_update(array $args, int $max_output_bytes): array {
+        $mode = (string) ($args[2] ?? '');
+        $slug = sanitize_key((string) ($args[3] ?? ''));
+
+        if (!$slug || !wp_get_theme($slug)->exists()) {
+            return self::native_error_result($args, 'Theme not found: ' . $slug, $max_output_bytes);
+        }
+
+        $auto_updates = get_site_option('auto_update_themes', []);
+        $auto_updates = is_array($auto_updates) ? $auto_updates : [];
+
+        if ($mode === 'enable') {
+            $auto_updates[] = $slug;
+        } elseif ($mode === 'disable') {
+            $auto_updates = array_diff($auto_updates, [$slug]);
+        } else {
+            return self::native_error_result($args, 'Auto-update mode must be enable or disable.', $max_output_bytes);
+        }
+
+        update_site_option('auto_update_themes', array_values(array_unique($auto_updates)));
+        return self::native_result($args, 'Theme auto-updates ' . ($mode === 'enable' ? 'enabled.' : 'disabled.'), '', 0, $max_output_bytes);
+    }
+
+    private static function native_option_get(array $args, int $max_output_bytes): array {
+        $name = (string) ($args[2] ?? '');
+        if ($name === '') {
+            return self::native_error_result($args, 'Option name is required.', $max_output_bytes);
+        }
+
+        $value = get_option($name);
+        return self::native_result($args, is_scalar($value) ? (string) $value : (string) wp_json_encode($value), '', 0, $max_output_bytes);
+    }
+
+    private static function native_config_list(array $args, int $max_output_bytes): array {
+        $rows = [
+            ['name' => 'ABSPATH', 'value' => ABSPATH, 'type' => 'constant'],
+            ['name' => 'WP_DEBUG', 'value' => defined('WP_DEBUG') && WP_DEBUG ? '1' : '0', 'type' => 'constant'],
+            ['name' => 'WP_MEMORY_LIMIT', 'value' => defined('WP_MEMORY_LIMIT') ? WP_MEMORY_LIMIT : '', 'type' => 'constant'],
+            ['name' => 'WP_MAX_MEMORY_LIMIT', 'value' => defined('WP_MAX_MEMORY_LIMIT') ? WP_MAX_MEMORY_LIMIT : '', 'type' => 'constant'],
+            ['name' => 'DB_CHARSET', 'value' => defined('DB_CHARSET') ? DB_CHARSET : '', 'type' => 'constant'],
+        ];
+
+        return in_array('--format=json', $args, true)
+            ? self::native_json_result($args, $rows, $max_output_bytes)
+            : self::native_result($args, implode("\n", array_map(static fn($row) => $row['name'] . "\t" . $row['value'], $rows)), '', 0, $max_output_bytes);
+    }
+
+    private static function native_cron_list(array $args, int $max_output_bytes): array {
+        $rows = [];
+        $cron = _get_cron_array();
+        $now = time();
+
+        foreach (is_array($cron) ? $cron : [] as $timestamp => $hooks) {
+            foreach ((array) $hooks as $hook => $events) {
+                foreach ((array) $events as $event) {
+                    $rows[] = [
+                        'hook' => (string) $hook,
+                        'next_run_relative' => human_time_diff($now, (int) $timestamp),
+                        'recurrence' => isset($event['schedule']) ? (string) $event['schedule'] : '',
+                    ];
+                }
+            }
+        }
+
+        usort($rows, static fn($a, $b) => strcmp($a['next_run_relative'], $b['next_run_relative']));
+        return self::native_json_result($args, array_slice($rows, 0, 500), $max_output_bytes);
+    }
+
+    private static function native_rewrite_list(array $args, int $max_output_bytes): array {
+        global $wp_rewrite;
+        $rules = $wp_rewrite instanceof WP_Rewrite ? $wp_rewrite->wp_rewrite_rules() : [];
+        $rows = [];
+
+        foreach (is_array($rules) ? $rules : [] as $match => $query) {
+            $rows[] = ['match' => (string) $match, 'query' => (string) $query];
+        }
+
+        return self::native_json_result($args, array_slice($rows, 0, 1000), $max_output_bytes);
+    }
+
+    private static function native_wp_cli(array $args, int $max_output_bytes): ?array {
+        $group = (string) ($args[0] ?? '');
+        $action = (string) ($args[1] ?? '');
+
+        try {
+            if ($group === 'core' && $action === 'version') {
+                return self::native_result($args, get_bloginfo('version'), '', 0, $max_output_bytes);
+            }
+
+            if ($group === 'core' && $action === 'check-update') {
+                return self::native_json_result($args, self::native_core_updates(), $max_output_bytes);
+            }
+
+            if ($group === 'core' && $action === 'update') {
+                return self::native_core_update($args, $max_output_bytes);
+            }
+
+            if ($group === 'core' && $action === 'update-db') {
+                return self::native_core_update_db($args, $max_output_bytes);
+            }
+
+            if ($group === 'plugin' && $action === 'list') {
+                return self::native_plugin_list($args, $max_output_bytes);
+            }
+
+            if ($group === 'plugin' && $action === 'update') {
+                return self::native_plugin_update($args, $max_output_bytes);
+            }
+
+            if ($group === 'plugin' && $action === 'activate') {
+                return self::native_plugin_activate($args, $max_output_bytes);
+            }
+
+            if ($group === 'plugin' && $action === 'deactivate') {
+                return self::native_plugin_deactivate($args, $max_output_bytes);
+            }
+
+            if ($group === 'plugin' && $action === 'delete') {
+                return self::native_plugin_delete($args, $max_output_bytes);
+            }
+
+            if ($group === 'plugin' && $action === 'install') {
+                return self::native_plugin_install($args, $max_output_bytes);
+            }
+
+            if ($group === 'plugin' && $action === 'auto-updates') {
+                return self::native_plugin_auto_update($args, $max_output_bytes);
+            }
+
+            if ($group === 'theme' && $action === 'list') {
+                return self::native_theme_list($args, $max_output_bytes);
+            }
+
+            if ($group === 'theme' && $action === 'update') {
+                return self::native_theme_update($args, $max_output_bytes);
+            }
+
+            if ($group === 'theme' && $action === 'activate') {
+                return self::native_theme_activate($args, $max_output_bytes);
+            }
+
+            if ($group === 'theme' && $action === 'delete') {
+                return self::native_theme_delete($args, $max_output_bytes);
+            }
+
+            if ($group === 'theme' && $action === 'install') {
+                return self::native_theme_install($args, $max_output_bytes);
+            }
+
+            if ($group === 'theme' && $action === 'auto-updates') {
+                return self::native_theme_auto_update($args, $max_output_bytes);
+            }
+
+            if ($group === 'option' && $action === 'get') {
+                return self::native_option_get($args, $max_output_bytes);
+            }
+
+            if ($group === 'config' && $action === 'list') {
+                return self::native_config_list($args, $max_output_bytes);
+            }
+
+            if ($group === 'cron' && $action === 'event' && (string) ($args[2] ?? '') === 'list') {
+                return self::native_cron_list($args, $max_output_bytes);
+            }
+
+            if ($group === 'rewrite' && $action === 'list') {
+                return self::native_rewrite_list($args, $max_output_bytes);
+            }
+
+            if ($group === 'eval') {
+                $code = implode(' ', array_slice($args, 1));
+
+                if (strpos($code, 'get_mu_plugins()') !== false && strpos($code, 'get_dropins()') !== false) {
+                    return self::native_plugin_metadata($args, $max_output_bytes);
+                }
+
+                if (strpos($code, 'wp_get_themes()') !== false) {
+                    return self::native_theme_metadata($args, $max_output_bytes);
+                }
+            }
+        } catch (Throwable $error) {
+            return self::native_error_result($args, $error->getMessage(), $max_output_bytes);
+        }
+
+        return null;
+    }
+
     private static function command_result(string $command, ?string $cwd, int $max_output_bytes): array {
         if (!self::exec_available()) {
             return [
@@ -1433,6 +2587,22 @@ JS;
 
         if (!$safe_args) {
             return ['exit_code' => 1, 'stdout' => '', 'stderr' => 'WP-CLI arguments are required.'];
+        }
+
+        $native = self::native_wp_cli($safe_args, $max_output_bytes);
+        if ($native !== null) {
+            return $native;
+        }
+
+        if (!self::exec_available()) {
+            return [
+                'command' => self::native_command($safe_args),
+                'cwd' => ABSPATH,
+                'exit_code' => 127,
+                'stdout' => '',
+                'stderr' => 'This connector action is not available without shell_exec/proc_open. Use a supported WordPress management action or reconnect with SFTP for server-level WP-CLI/shell access.',
+                'timed_out' => false,
+            ];
         }
 
         $command = 'wp ' . implode(' ', array_map('escapeshellarg', $safe_args)) . ' --path=' . escapeshellarg(ABSPATH);
