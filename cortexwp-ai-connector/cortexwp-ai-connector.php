@@ -21,6 +21,9 @@ final class CortexWP_AI_Connector {
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
     private const ROUTE_NAMESPACE = 'cortexwp-ai/v1';
     private const SNIPPET_DIR = 'cortexwp-snippets';
+    private const RECOVERY_BRIDGE_PREFIX = 'cortexwp-recovery-';
+    private const RECOVERY_BACKUP_DIR = 'cortexwp-recovery-backups';
+    private const RECOVERY_AUDIT_DIR = 'cortexwp-recovery-audit';
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
     private const DEFAULT_APP_URL = 'http://127.0.0.1:3000';
@@ -42,6 +45,7 @@ final class CortexWP_AI_Connector {
         add_filter('plugins_api', [__CLASS__, 'plugin_update_details'], 10, 3);
         register_shutdown_function([__CLASS__, 'capture_fatal_error']);
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
+        self::maybe_ensure_recovery_bridge();
     }
 
     public static function activate(): void {
@@ -60,6 +64,27 @@ final class CortexWP_AI_Connector {
         }
 
         self::ensure_snippet_dir();
+        self::ensure_recovery_bridge(true);
+    }
+
+    private static function maybe_ensure_recovery_bridge(): void {
+        if (self::should_check_recovery_bridge_on_boot()) {
+            self::ensure_recovery_bridge(false);
+        }
+    }
+
+    private static function should_check_recovery_bridge_on_boot(): bool {
+        if (defined('WP_CLI') && WP_CLI) {
+            return true;
+        }
+
+        if (function_exists('is_admin') && is_admin()) {
+            return true;
+        }
+
+        $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+
+        return $uri !== '' && strpos($uri, '/wp-json/' . self::ROUTE_NAMESPACE . '/') !== false;
     }
 
     private static function new_key(): string {
@@ -170,7 +195,7 @@ final class CortexWP_AI_Connector {
         $domain = self::key_domain();
 
         wp_remote_post(self::fatal_error_endpoint(), [
-            'blocking' => true,
+            'blocking' => false,
             'body' => $body,
             'headers' => [
                 'Content-Type' => 'application/json',
@@ -181,7 +206,7 @@ final class CortexWP_AI_Connector {
                 'X-CortexWP-Timestamp' => $timestamp,
             ],
             'redirection' => 0,
-            'timeout' => 3,
+            'timeout' => 1,
         ]);
     }
 
@@ -1181,8 +1206,12 @@ JS;
         check_admin_referer('cortexwp_ai_save');
 
         if (!empty($_POST['regenerate_key'])) {
+            $had_recovery_bridge = self::has_any_recovery_bridge();
             self::store_key(self::new_key());
             update_option(self::OPTION_KEY_DOMAIN, self::current_domain(), false);
+            if ($had_recovery_bridge) {
+                self::ensure_recovery_bridge(true);
+            }
         }
 
         update_option(self::OPTION_SETTINGS, array_merge(self::connector_settings(), [
@@ -1202,12 +1231,16 @@ JS;
 
         $key = self::new_key();
         $domain = self::current_domain();
+        $had_recovery_bridge = self::has_any_recovery_bridge();
 
         self::store_key($key);
         update_option(self::OPTION_KEY_DOMAIN, $domain, false);
         update_option(self::OPTION_SETTINGS, array_merge(self::connector_settings(), [
             'connection_method' => 'plugin',
         ]), false);
+        if ($had_recovery_bridge) {
+            self::ensure_recovery_bridge(true);
+        }
 
         wp_send_json_success([
             'key' => $key,
@@ -1358,6 +1391,26 @@ JS;
                 return rest_ensure_response(self::read_file((string) ($params['path'] ?? ''), (int) ($params['lines'] ?? 120), (int) ($params['max_output_bytes'] ?? 500000)));
             case 'list_directory':
                 return rest_ensure_response(self::list_directory((string) ($params['path'] ?? ABSPATH)));
+            case 'php_environment':
+                return rest_ensure_response(self::php_environment());
+            case 'patch_file':
+                return rest_ensure_response(self::patch_file(
+                    (string) ($params['path'] ?? ''),
+                    (string) ($params['search'] ?? ''),
+                    (string) ($params['replace'] ?? ''),
+                    (int) ($params['max_replacements'] ?? 1)
+                ));
+            case 'restore_file_backup':
+                return rest_ensure_response(self::restore_file_backup(
+                    (string) ($params['backup_path'] ?? ''),
+                    (string) ($params['target_path'] ?? '')
+                ));
+            case 'recovery_bridge_install':
+                return rest_ensure_response(self::ensure_recovery_bridge(true));
+            case 'recovery_bridge_status':
+                return rest_ensure_response(self::recovery_bridge_status());
+            case 'recovery_audit_log':
+                return rest_ensure_response(self::recovery_audit_log((int) ($params['limit'] ?? 50)));
             case 'list_snippets':
                 return rest_ensure_response(['snippets' => self::list_snippets()]);
             case 'save_snippet':
@@ -1391,6 +1444,9 @@ JS;
             'native_management_available' => true,
             'fatal_error_monitor' => true,
             'fatal_error_endpoint' => self::fatal_error_endpoint(),
+            'php_environment' => true,
+            'safe_file_patch' => true,
+            'recovery_bridge' => self::recovery_bridge_status(),
             'wp_cli_available' => self::wp_cli_available(),
         ];
     }
@@ -1640,6 +1696,1034 @@ JS;
         return (int) $result['exit_code'] === 0;
     }
 
+    private static function normalized_real_path(string $path): string {
+        return rtrim(wp_normalize_path($path), '/');
+    }
+
+    private static function path_is_within(string $path, string $directory): bool {
+        $real_path = realpath($path);
+        $real_directory = realpath($directory);
+
+        if (!$real_path || !$real_directory) {
+            return false;
+        }
+
+        $normalized_path = self::normalized_real_path($real_path);
+        $normalized_directory = trailingslashit(self::normalized_real_path($real_directory));
+
+        return strpos($normalized_path, $normalized_directory) === 0;
+    }
+
+    private static function public_site_path(string $path): string {
+        $root = realpath(ABSPATH);
+        $real = realpath($path);
+
+        if (!$root || !$real) {
+            return $path;
+        }
+
+        $normalized_root = trailingslashit(self::normalized_real_path($root));
+        $normalized_real = self::normalized_real_path($real);
+
+        if (strpos($normalized_real, $normalized_root) === 0) {
+            return substr($normalized_real, strlen($normalized_root));
+        }
+
+        return $normalized_real;
+    }
+
+    private static function allowed_dropin_files(): array {
+        return [
+            'advanced-cache.php',
+            'object-cache.php',
+            'db.php',
+            'db-error.php',
+            'install.php',
+            'maintenance.php',
+            'sunrise.php',
+            'blog-deleted.php',
+            'blog-inactive.php',
+            'blog-suspended.php',
+        ];
+    }
+
+    private static function is_mutable_php_file(string $file): bool {
+        $real_file = realpath($file);
+
+        if (!$real_file || !is_file($real_file) || strtolower(pathinfo($real_file, PATHINFO_EXTENSION)) !== 'php') {
+            return false;
+        }
+
+        $allowed_directories = array_filter([
+            defined('WP_PLUGIN_DIR') ? WP_PLUGIN_DIR : '',
+            function_exists('get_theme_root') ? get_theme_root() : trailingslashit(WP_CONTENT_DIR) . 'themes',
+            defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : trailingslashit(WP_CONTENT_DIR) . 'mu-plugins',
+        ]);
+
+        foreach ($allowed_directories as $directory) {
+            if (is_dir($directory) && self::path_is_within($real_file, $directory)) {
+                return true;
+            }
+        }
+
+        $content_dir = realpath(WP_CONTENT_DIR);
+        if ($content_dir && dirname($real_file) === $content_dir) {
+            return in_array(strtolower(basename($real_file)), self::allowed_dropin_files(), true);
+        }
+
+        return false;
+    }
+
+    private static function recovery_backup_dir(): string {
+        return trailingslashit(WP_CONTENT_DIR) . self::RECOVERY_BACKUP_DIR;
+    }
+
+    private static function ensure_recovery_backup_dir(): bool {
+        $dir = self::recovery_backup_dir();
+
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            return false;
+        }
+
+        if (!is_writable($dir)) {
+            return false;
+        }
+
+        self::write_snippet_directory_protection_files($dir);
+
+        return true;
+    }
+
+    private static function backup_file_before_patch(string $file, string $reason = 'patch') {
+        if (!self::ensure_recovery_backup_dir()) {
+            return new WP_Error('cortexwp_ai_backup_dir', 'CortexWP recovery backup directory is not writable.', ['status' => 500]);
+        }
+
+        $hash = substr(hash('sha256', $file . '|' . microtime(true)), 0, 12);
+        $backup_name = gmdate('Ymd-His') . '-' . $hash . '-' . sanitize_file_name(basename($file));
+        $backup_path = trailingslashit(self::recovery_backup_dir()) . $backup_name;
+
+        if (!copy($file, $backup_path)) {
+            return new WP_Error('cortexwp_ai_backup_failed', 'Unable to create a backup before patching.', ['status' => 500]);
+        }
+
+        file_put_contents($backup_path . '.json', wp_json_encode([
+            'target_path' => $file,
+            'target_public_path' => self::public_site_path($file),
+            'backup_path' => $backup_path,
+            'created_at' => gmdate('c'),
+            'reason' => $reason,
+        ], JSON_PRETTY_PRINT));
+
+        return $backup_path;
+    }
+
+    private static function replace_limited(string $contents, string $search, string $replace, int $limit): string {
+        $result = '';
+        $offset = 0;
+        $replacements = 0;
+        $search_length = strlen($search);
+
+        while ($replacements < $limit) {
+            $position = strpos($contents, $search, $offset);
+            if ($position === false) {
+                break;
+            }
+
+            $result .= substr($contents, $offset, $position - $offset) . $replace;
+            $offset = $position + $search_length;
+            $replacements++;
+        }
+
+        return $result . substr($contents, $offset);
+    }
+
+    private static function patch_file(string $path, string $search, string $replace, int $max_replacements) {
+        $file = self::safe_path($path);
+
+        if (!$file || !is_file($file) || !is_readable($file) || !is_writable($file)) {
+            return new WP_Error('cortexwp_ai_patch_unavailable', 'File not found, not readable, or not writable.', ['status' => 404]);
+        }
+
+        if (!self::is_mutable_php_file($file)) {
+            return new WP_Error('cortexwp_ai_patch_denied', 'Only PHP files inside wp-content plugins, themes, mu-plugins, and known drop-ins can be patched through connector recovery.', ['status' => 403]);
+        }
+
+        if ($search === '') {
+            return new WP_Error('cortexwp_ai_patch_search_required', 'Exact search text is required.', ['status' => 400]);
+        }
+
+        $contents = (string) file_get_contents($file);
+        $matches = substr_count($contents, $search);
+
+        if ($matches === 0) {
+            return new WP_Error('cortexwp_ai_patch_no_match', 'The exact search text was not found in the target file.', ['status' => 400]);
+        }
+
+        $limit = max(1, min(20, $max_replacements));
+        if ($matches > $limit) {
+            return new WP_Error('cortexwp_ai_patch_too_many_matches', 'The exact search text matched more times than allowed. Use a more specific search string.', ['status' => 400]);
+        }
+
+        $backup = self::backup_file_before_patch($file, 'patch_file');
+        if (is_wp_error($backup)) {
+            return $backup;
+        }
+
+        $updated = self::replace_limited($contents, $search, $replace, $limit);
+        $written = file_put_contents($file, $updated, LOCK_EX);
+
+        if ($written === false) {
+            return new WP_Error('cortexwp_ai_patch_write_failed', 'Unable to write the patched file.', ['status' => 500]);
+        }
+
+        self::append_recovery_audit('patch_file', [
+            'path' => self::public_site_path($file),
+            'backup_path' => self::public_site_path($backup),
+            'replacements' => $matches,
+            'runner' => 'wordpress-rest',
+        ], 'succeeded');
+
+        return [
+            'patched' => true,
+            'path' => $file,
+            'public_path' => self::public_site_path($file),
+            'backup_path' => $backup,
+            'backup_public_path' => self::public_site_path($backup),
+            'replacements' => $matches,
+            'syntax_validation' => self::exec_available() ? 'available_for_snippets_only' : 'not_available_without_process_execution',
+        ];
+    }
+
+    private static function restore_file_backup(string $backup_path, string $target_path = '') {
+        $backup = self::safe_path($backup_path);
+        $backup_dir = realpath(self::recovery_backup_dir());
+
+        if (!$backup || !$backup_dir || !self::path_is_within($backup, $backup_dir) || !is_file($backup) || !is_readable($backup)) {
+            return new WP_Error('cortexwp_ai_backup_not_found', 'Backup file was not found or is not readable.', ['status' => 404]);
+        }
+
+        $metadata_path = $backup . '.json';
+        $metadata = is_readable($metadata_path) ? json_decode((string) file_get_contents($metadata_path), true) : [];
+        $target = $target_path !== ''
+            ? self::safe_path($target_path)
+            : (is_array($metadata) ? self::safe_path((string) ($metadata['target_path'] ?? '')) : '');
+
+        if ($target === '') {
+            $target = is_array($metadata) ? self::safe_path((string) ($metadata['target_public_path'] ?? '')) : '';
+        }
+
+        if (!$target || !is_file($target) || !is_writable($target)) {
+            return new WP_Error('cortexwp_ai_restore_target', 'Restore target was not found or is not writable.', ['status' => 404]);
+        }
+
+        if (!self::is_mutable_php_file($target)) {
+            return new WP_Error('cortexwp_ai_restore_denied', 'Only PHP files inside wp-content plugins, themes, mu-plugins, and known drop-ins can be restored through connector recovery.', ['status' => 403]);
+        }
+
+        $current_backup = self::backup_file_before_patch($target, 'pre_restore');
+        if (is_wp_error($current_backup)) {
+            return $current_backup;
+        }
+
+        if (!copy($backup, $target)) {
+            return new WP_Error('cortexwp_ai_restore_failed', 'Unable to restore the backup file.', ['status' => 500]);
+        }
+
+        self::append_recovery_audit('restore_file_backup', [
+            'target_path' => self::public_site_path($target),
+            'backup_path' => self::public_site_path($backup),
+            'pre_restore_backup_path' => self::public_site_path($current_backup),
+            'runner' => 'wordpress-rest',
+        ], 'succeeded');
+
+        return [
+            'restored' => true,
+            'target_path' => $target,
+            'target_public_path' => self::public_site_path($target),
+            'backup_path' => $backup,
+            'pre_restore_backup_path' => $current_backup,
+        ];
+    }
+
+    private static function php_environment(): array {
+        $disabled = array_values(array_filter(array_map('trim', explode(',', (string) ini_get('disable_functions')))));
+        $extensions = get_loaded_extensions();
+        sort($extensions);
+
+        return [
+            'php' => [
+                'version' => PHP_VERSION,
+                'sapi' => PHP_SAPI,
+                'os' => PHP_OS_FAMILY,
+                'memory_limit' => ini_get('memory_limit'),
+                'max_execution_time' => ini_get('max_execution_time'),
+                'upload_max_filesize' => ini_get('upload_max_filesize'),
+                'post_max_size' => ini_get('post_max_size'),
+                'disabled_functions' => $disabled,
+                'extensions' => $extensions,
+            ],
+            'wordpress' => [
+                'version' => get_bloginfo('version'),
+                'environment_type' => function_exists('wp_get_environment_type') ? wp_get_environment_type() : '',
+                'debug' => defined('WP_DEBUG') ? (bool) WP_DEBUG : false,
+                'script_debug' => defined('SCRIPT_DEBUG') ? (bool) SCRIPT_DEBUG : false,
+                'site_url' => site_url(),
+                'home_url' => home_url(),
+            ],
+            'paths' => [
+                'ABSPATH' => ABSPATH,
+                'WP_CONTENT_DIR' => WP_CONTENT_DIR,
+                'WP_PLUGIN_DIR' => defined('WP_PLUGIN_DIR') ? WP_PLUGIN_DIR : '',
+                'WPMU_PLUGIN_DIR' => defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : '',
+                'theme_root' => function_exists('get_theme_root') ? get_theme_root() : '',
+                'temp_dir' => function_exists('get_temp_dir') ? get_temp_dir() : sys_get_temp_dir(),
+            ],
+            'writable' => [
+                'root' => is_writable(ABSPATH),
+                'wp_content' => is_writable(WP_CONTENT_DIR),
+                'plugins' => defined('WP_PLUGIN_DIR') && is_writable(WP_PLUGIN_DIR),
+                'themes' => function_exists('get_theme_root') && is_writable(get_theme_root()),
+                'mu_plugins' => defined('WPMU_PLUGIN_DIR') ? (is_dir(WPMU_PLUGIN_DIR) ? is_writable(WPMU_PLUGIN_DIR) : is_writable(WP_CONTENT_DIR)) : false,
+                'recovery_backups' => is_dir(self::recovery_backup_dir()) ? is_writable(self::recovery_backup_dir()) : is_writable(WP_CONTENT_DIR),
+            ],
+            'capabilities' => [
+                'exec_available' => self::exec_available(),
+                'wp_cli_available' => self::wp_cli_available(),
+                'native_management_available' => true,
+                'safe_file_patch' => true,
+                'recovery_bridge' => self::recovery_bridge_status(),
+            ],
+        ];
+    }
+
+    private static function recovery_secret(): string {
+        $key = self::connector_key();
+
+        return $key === '' ? '' : hash_hmac('sha256', 'cortexwp-recovery-bridge-secret-v1', $key);
+    }
+
+    private static function recovery_bridge_file_name(?string $key = null): string {
+        $connector_key = $key ?? self::connector_key();
+        if ($connector_key === '') {
+            return self::RECOVERY_BRIDGE_PREFIX . 'unavailable.php';
+        }
+
+        $suffix = substr(hash_hmac('sha256', 'cortexwp-recovery-bridge-path-v1', $connector_key), 0, 16);
+
+        return self::RECOVERY_BRIDGE_PREFIX . $suffix . '.php';
+    }
+
+    private static function recovery_bridge_path(): string {
+        return trailingslashit(ABSPATH) . self::recovery_bridge_file_name();
+    }
+
+    private static function recovery_bridge_url(): string {
+        return trailingslashit(site_url()) . self::recovery_bridge_file_name();
+    }
+
+    private static function has_any_recovery_bridge(): bool {
+        return (bool) glob(trailingslashit(ABSPATH) . self::RECOVERY_BRIDGE_PREFIX . '*.php');
+    }
+
+    private static function remove_stale_recovery_bridges(): void {
+        $current = self::normalized_real_path(self::recovery_bridge_path());
+
+        foreach (glob(trailingslashit(ABSPATH) . self::RECOVERY_BRIDGE_PREFIX . '*.php') ?: [] as $file) {
+            if (self::normalized_real_path($file) !== $current && is_file($file) && is_writable($file)) {
+                unlink($file);
+            }
+        }
+    }
+
+    private static function recovery_audit_dir(): string {
+        return trailingslashit(WP_CONTENT_DIR) . self::RECOVERY_AUDIT_DIR;
+    }
+
+    private static function ensure_recovery_audit_dir(): bool {
+        $dir = self::recovery_audit_dir();
+
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            return false;
+        }
+
+        if (!is_writable($dir)) {
+            return false;
+        }
+
+        self::write_snippet_directory_protection_files($dir);
+
+        return true;
+    }
+
+    private static function append_recovery_audit(string $action, array $details = [], string $status = 'succeeded'): void {
+        if (!self::ensure_recovery_audit_dir()) {
+            return;
+        }
+
+        $entry = [
+            'time' => gmdate('c'),
+            'action' => sanitize_key($action),
+            'status' => $status,
+            'details' => $details,
+        ];
+        $path = trailingslashit(self::recovery_audit_dir()) . gmdate('Y-m-d') . '.log';
+
+        file_put_contents($path, wp_json_encode($entry) . "\n", FILE_APPEND | LOCK_EX);
+    }
+
+    private static function recovery_audit_log(int $limit = 50): array {
+        $limit = max(1, min(200, $limit));
+        $dir = self::recovery_audit_dir();
+
+        if (!is_dir($dir)) {
+            return ['entries' => []];
+        }
+
+        $files = glob(trailingslashit($dir) . '*.log') ?: [];
+        rsort($files);
+        $entries = [];
+
+        foreach ($files as $file) {
+            $lines = is_readable($file) ? file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) : [];
+            foreach (array_reverse($lines ?: []) as $line) {
+                $decoded = json_decode($line, true);
+                if (is_array($decoded)) {
+                    $entries[] = $decoded;
+                }
+
+                if (count($entries) >= $limit) {
+                    break 2;
+                }
+            }
+        }
+
+        return ['entries' => $entries];
+    }
+
+    private static function recovery_bridge_status(): array {
+        $path = self::recovery_bridge_path();
+
+        return [
+            'installed' => is_file($path) && is_readable($path),
+            'root_writable' => is_writable(ABSPATH),
+            'modified' => is_file($path) ? gmdate('c', filemtime($path) ?: time()) : null,
+            'audit_entries' => self::recovery_audit_log(5)['entries'],
+        ];
+    }
+
+    private static function ensure_recovery_bridge(bool $force = false): array {
+        if (self::connector_key() === '') {
+            return array_merge(self::recovery_bridge_status(), [
+                'installed' => false,
+                'error' => 'The connector key could not be decrypted yet, so the recovery bridge was not installed.',
+            ]);
+        }
+
+        $path = self::recovery_bridge_path();
+
+        if (!$force) {
+            if (is_file($path) && is_readable($path)) {
+                return self::recovery_bridge_status();
+            }
+        }
+
+        if (!is_writable(ABSPATH) && !(is_file($path) && is_writable($path))) {
+            return array_merge(self::recovery_bridge_status(), [
+                'installed' => false,
+                'error' => 'WordPress root is not writable, so the recovery bridge could not be installed.',
+            ]);
+        }
+
+        $written = file_put_contents($path, self::recovery_bridge_php(), LOCK_EX);
+
+        if ($written === false) {
+            return array_merge(self::recovery_bridge_status(), [
+                'installed' => false,
+                'error' => 'Unable to write the CortexWP recovery bridge file.',
+            ]);
+        }
+
+        self::remove_stale_recovery_bridges();
+        self::append_recovery_audit('recovery_bridge_install', [
+            'path' => self::public_site_path($path),
+            'access' => 'signed_post_only',
+        ], 'succeeded');
+
+        return self::recovery_bridge_status();
+    }
+
+    private static function recovery_bridge_php(): string {
+        $secret_export = var_export(self::recovery_secret(), true);
+        $version_export = var_export(self::plugin_version(), true);
+        $bridge_file_export = var_export(self::recovery_bridge_file_name(), true);
+
+        $template = <<<'PHP'
+<?php
+declare(strict_types=1);
+
+define('CORTEXWP_RECOVERY_SECRET', %%SECRET%%);
+define('CORTEXWP_RECOVERY_VERSION', %%VERSION%%);
+define('CORTEXWP_RECOVERY_FILE', %%BRIDGE_FILE%%);
+define('CORTEXWP_RECOVERY_ROOT', __DIR__);
+define('CORTEXWP_RECOVERY_MAX_BODY_BYTES', 262144);
+define('CORTEXWP_RECOVERY_MAX_OUTPUT_BYTES', 500000);
+
+function cwp_not_found(): void {
+    http_response_code(404);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('X-Robots-Tag: noindex, nofollow');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    echo 'Not Found';
+    exit;
+}
+
+function cwp_response($payload, int $status = 200): void {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    header('X-Robots-Tag: noindex, nofollow');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    echo json_encode($payload, JSON_PRETTY_PRINT);
+    exit;
+}
+
+function cwp_fail(string $message, int $status = 400): void {
+    cwp_response(['error' => $message], $status);
+}
+
+function cwp_header(string $name): string {
+    $key = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
+    return isset($_SERVER[$key]) ? trim((string) $_SERVER[$key]) : '';
+}
+
+function cwp_has_recovery_headers(): bool {
+    return cwp_header('x-cortexwp-timestamp') !== ''
+        && cwp_header('x-cortexwp-nonce') !== ''
+        && cwp_header('x-cortexwp-signature') !== '';
+}
+
+if (
+    strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? '')) !== 'POST'
+    || !cwp_has_recovery_headers()
+    || (int) ($_SERVER['CONTENT_LENGTH'] ?? 0) > CORTEXWP_RECOVERY_MAX_BODY_BYTES
+) {
+    cwp_not_found();
+}
+
+function cwp_protect_dir(string $dir): void {
+    if (!is_dir($dir)) {
+        return;
+    }
+
+    $files = [
+        '.htaccess' => "Options -Indexes\n<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n",
+        'index.php' => "<?php\n// Silence is good\n",
+        'web.config' => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration><system.webServer><security><authorization><add accessType=\"Deny\" users=\"*\" /></authorization></security></system.webServer></configuration>\n",
+    ];
+
+    foreach ($files as $name => $contents) {
+        $path = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . $name;
+        if (!is_file($path) || is_writable($path)) {
+            @file_put_contents($path, $contents, LOCK_EX);
+        }
+    }
+}
+
+function cwp_dir(string $name): string {
+    return CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . $name;
+}
+
+function cwp_ensure_dir(string $name): string {
+    $dir = cwp_dir($name);
+
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
+        cwp_fail('Recovery storage directory is not writable.', 500);
+    }
+
+    if (!is_writable($dir)) {
+        cwp_fail('Recovery storage directory is not writable.', 500);
+    }
+
+    cwp_protect_dir($dir);
+    return $dir;
+}
+
+function cwp_audit(string $action, array $details = [], string $status = 'succeeded'): void {
+    $dir = cwp_ensure_dir('cortexwp-recovery-audit');
+    $entry = [
+        'time' => gmdate('c'),
+        'action' => preg_replace('/[^a-z0-9_]/i', '', $action),
+        'status' => $status,
+        'request_id' => cwp_header('x-cortexwp-nonce') ? substr(hash('sha256', cwp_header('x-cortexwp-nonce')), 0, 16) : null,
+        'ip_hash' => isset($_SERVER['REMOTE_ADDR']) ? substr(hash_hmac('sha256', (string) $_SERVER['REMOTE_ADDR'], CORTEXWP_RECOVERY_SECRET), 0, 16) : null,
+        'details' => $details,
+    ];
+
+    @file_put_contents(rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . gmdate('Y-m-d') . '.log', json_encode($entry) . "\n", FILE_APPEND | LOCK_EX);
+}
+
+function cwp_audit_log(int $limit = 50): array {
+    $limit = max(1, min(200, $limit));
+    $dir = cwp_dir('cortexwp-recovery-audit');
+
+    if (!is_dir($dir)) {
+        return ['entries' => []];
+    }
+
+    $files = glob(rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . '*.log') ?: [];
+    rsort($files);
+    $entries = [];
+
+    foreach ($files as $file) {
+        $lines = is_readable($file) ? file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) : [];
+        foreach (array_reverse($lines ?: []) as $line) {
+            $decoded = json_decode($line, true);
+            if (is_array($decoded)) {
+                $entries[] = $decoded;
+            }
+
+            if (count($entries) >= $limit) {
+                break 2;
+            }
+        }
+    }
+
+    return ['entries' => $entries];
+}
+
+function cwp_verify(string $body): void {
+    if (strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? '')) !== 'POST') {
+        cwp_not_found();
+    }
+
+    if ((int) ($_SERVER['CONTENT_LENGTH'] ?? strlen($body)) > CORTEXWP_RECOVERY_MAX_BODY_BYTES) {
+        cwp_not_found();
+    }
+
+    $timestamp = cwp_header('x-cortexwp-timestamp');
+    $nonce = cwp_header('x-cortexwp-nonce');
+    $provided = cwp_header('x-cortexwp-signature');
+
+    if ($timestamp === '' || $nonce === '' || $provided === '' || abs(time() - (int) $timestamp) > 300) {
+        cwp_not_found();
+    }
+
+    $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
+    $path = $path ?: '/' . CORTEXWP_RECOVERY_FILE;
+    $expected = hash_hmac('sha256', implode("\n", [
+        'POST',
+        $path,
+        hash('sha256', $body),
+        $timestamp,
+        $nonce,
+    ]), CORTEXWP_RECOVERY_SECRET);
+
+    if (!hash_equals($expected, $provided)) {
+        cwp_audit('auth_failed', ['reason' => 'signature'], 'failed');
+        cwp_not_found();
+    }
+
+    $nonce_dir = cwp_ensure_dir('cortexwp-recovery-nonces');
+    foreach (glob(rtrim($nonce_dir, '/\\') . DIRECTORY_SEPARATOR . '*.nonce') ?: [] as $file) {
+        if (is_file($file) && filemtime($file) < time() - 600) {
+            @unlink($file);
+        }
+    }
+
+    $nonce_file = rtrim($nonce_dir, '/\\') . DIRECTORY_SEPARATOR . hash('sha256', $nonce) . '.nonce';
+    if (is_file($nonce_file)) {
+        cwp_audit('auth_failed', ['reason' => 'replay'], 'failed');
+        cwp_fail('Replay detected.', 403);
+    }
+
+    if (@file_put_contents($nonce_file, gmdate('c'), LOCK_EX) === false) {
+        cwp_fail('Recovery nonce could not be stored.', 500);
+    }
+}
+
+function cwp_norm(string $path): string {
+    return rtrim(str_replace('\\', '/', $path), '/');
+}
+
+function cwp_safe_name(string $name): string {
+    $name = basename($name);
+    $name = preg_replace('/[^A-Za-z0-9._-]+/', '-', $name);
+    return trim((string) $name, '.-') ?: 'file.php';
+}
+
+function cwp_safe_path(string $path): string {
+    $path = trim($path);
+    $path = $path === '' ? CORTEXWP_RECOVERY_ROOT : $path;
+    $absolute = preg_match('/^[A-Za-z]:[\/\\\\]/', $path) || strpos($path, '/') === 0 || strpos($path, '\\') === 0;
+    $candidate = $absolute ? $path : CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . ltrim($path, '/\\');
+    $real = realpath($candidate);
+    $root = realpath(CORTEXWP_RECOVERY_ROOT);
+
+    if (!$real || !$root) {
+        return '';
+    }
+
+    $normalized_real = cwp_norm($real);
+    $normalized_root = cwp_norm($root);
+    $root_prefix = rtrim($normalized_root, '/') . '/';
+
+    if ($normalized_real !== $normalized_root && strpos($normalized_real, $root_prefix) !== 0) {
+        return '';
+    }
+
+    return $real;
+}
+
+function cwp_within(string $path, string $directory): bool {
+    $real_path = realpath($path);
+    $real_directory = realpath($directory);
+
+    if (!$real_path || !$real_directory) {
+        return false;
+    }
+
+    return strpos(cwp_norm($real_path), rtrim(cwp_norm($real_directory), '/') . '/') === 0;
+}
+
+function cwp_public_path(string $path): string {
+    $real = realpath($path);
+    $root = realpath(CORTEXWP_RECOVERY_ROOT);
+
+    if (!$real || !$root) {
+        return $path;
+    }
+
+    $normalized_real = cwp_norm($real);
+    $normalized_root = rtrim(cwp_norm($root), '/') . '/';
+
+    if (strpos($normalized_real, $normalized_root) === 0) {
+        return substr($normalized_real, strlen($normalized_root));
+    }
+
+    return $normalized_real;
+}
+
+function cwp_allowed_dropins(): array {
+    return [
+        'advanced-cache.php',
+        'object-cache.php',
+        'db.php',
+        'db-error.php',
+        'install.php',
+        'maintenance.php',
+        'sunrise.php',
+        'blog-deleted.php',
+        'blog-inactive.php',
+        'blog-suspended.php',
+    ];
+}
+
+function cwp_is_recoverable_php_file(string $file): bool {
+    $real = realpath($file);
+
+    if (!$real || !is_file($real) || strtolower(pathinfo($real, PATHINFO_EXTENSION)) !== 'php') {
+        return false;
+    }
+
+    $content = CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content';
+    foreach (['plugins', 'themes', 'mu-plugins'] as $name) {
+        $dir = $content . DIRECTORY_SEPARATOR . $name;
+        if (is_dir($dir) && cwp_within($real, $dir)) {
+            return true;
+        }
+    }
+
+    $real_content = realpath($content);
+    if ($real_content && dirname($real) === $real_content) {
+        return in_array(strtolower(basename($real)), cwp_allowed_dropins(), true);
+    }
+
+    return false;
+}
+
+function cwp_is_listable_directory(string $dir): bool {
+    $real = realpath($dir);
+    if (!$real || !is_dir($real)) {
+        return false;
+    }
+
+    $content = realpath(CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content');
+    if ($content && cwp_norm($real) === cwp_norm($content)) {
+        return true;
+    }
+
+    foreach (['plugins', 'themes', 'mu-plugins'] as $name) {
+        $allowed = CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . $name;
+        if (is_dir($allowed) && (cwp_norm($real) === cwp_norm(realpath($allowed) ?: '') || cwp_within($real, $allowed))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function cwp_is_readable_recovery_file(string $file): bool {
+    if (cwp_is_recoverable_php_file($file)) {
+        return true;
+    }
+
+    $debug_log = CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . 'debug.log';
+    return realpath($file) && realpath($debug_log) && cwp_norm(realpath($file)) === cwp_norm(realpath($debug_log));
+}
+
+function cwp_backup_dir(): string {
+    return cwp_ensure_dir('cortexwp-recovery-backups');
+}
+
+function cwp_backup_file(string $file, string $reason): string {
+    $dir = cwp_backup_dir();
+    $backup = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . gmdate('Ymd-His') . '-' . substr(hash('sha256', $file . '|' . microtime(true)), 0, 12) . '-' . cwp_safe_name(basename($file));
+
+    if (!@copy($file, $backup)) {
+        cwp_fail('Unable to create a backup before writing.', 500);
+    }
+
+    @file_put_contents($backup . '.json', json_encode([
+        'target_path' => $file,
+        'target_public_path' => cwp_public_path($file),
+        'backup_path' => $backup,
+        'created_at' => gmdate('c'),
+        'reason' => $reason,
+    ], JSON_PRETTY_PRINT), LOCK_EX);
+
+    return $backup;
+}
+
+function cwp_replace_limited(string $contents, string $search, string $replace, int $limit): string {
+    $result = '';
+    $offset = 0;
+    $count = 0;
+    $length = strlen($search);
+
+    while ($count < $limit) {
+        $position = strpos($contents, $search, $offset);
+        if ($position === false) {
+            break;
+        }
+
+        $result .= substr($contents, $offset, $position - $offset) . $replace;
+        $offset = $position + $length;
+        $count++;
+    }
+
+    return $result . substr($contents, $offset);
+}
+
+function cwp_read_file(array $input): array {
+    $file = cwp_safe_path((string) ($input['path'] ?? ''));
+    $lines = max(1, min(1000, (int) ($input['lines'] ?? 160)));
+    $max_bytes = max(1024, min(CORTEXWP_RECOVERY_MAX_OUTPUT_BYTES, (int) ($input['max_output_bytes'] ?? CORTEXWP_RECOVERY_MAX_OUTPUT_BYTES)));
+
+    if (!$file || !is_file($file) || !is_readable($file) || !cwp_is_readable_recovery_file($file)) {
+        return ['path' => (string) ($input['path'] ?? ''), 'found' => false, 'stdout' => '', 'stderr' => 'File not found, not readable, or outside recovery scope.', 'exit_code' => 1];
+    }
+
+    $contents = file($file, FILE_IGNORE_NEW_LINES);
+    $tail = array_slice($contents ?: [], -$lines);
+    cwp_audit('read_file', ['path' => cwp_public_path($file), 'lines' => count($tail)], 'succeeded');
+
+    return [
+        'path' => $file,
+        'public_path' => cwp_public_path($file),
+        'found' => true,
+        'lines' => count($tail),
+        'stdout' => substr(implode("\n", $tail), 0, $max_bytes),
+        'stderr' => '',
+        'exit_code' => 0,
+        'runner' => 'cortexwp-recovery-bridge',
+    ];
+}
+
+function cwp_list_directory(array $input): array {
+    $dir = cwp_safe_path((string) ($input['path'] ?? (CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content')));
+
+    if (!$dir || !is_dir($dir) || !is_readable($dir) || !cwp_is_listable_directory($dir)) {
+        return ['path' => (string) ($input['path'] ?? ''), 'entries' => [], 'stderr' => 'Directory not found, not readable, or outside recovery scope.', 'exit_code' => 1];
+    }
+
+    $entries = [];
+    foreach (array_slice(scandir($dir) ?: [], 0, 300) as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+
+        $full = $dir . DIRECTORY_SEPARATOR . $entry;
+        $entries[] = sprintf('%s %s %s', is_dir($full) ? 'd' : '-', filesize($full) ?: 0, $full);
+    }
+
+    cwp_audit('list_directory', ['path' => cwp_public_path($dir), 'entries' => count($entries)], 'succeeded');
+    return ['path' => $dir, 'public_path' => cwp_public_path($dir), 'entries' => $entries, 'stderr' => '', 'exit_code' => 0, 'runner' => 'cortexwp-recovery-bridge'];
+}
+
+function cwp_patch_file(array $input): array {
+    $file = cwp_safe_path((string) ($input['path'] ?? ''));
+    $search = (string) ($input['search'] ?? '');
+    $replace = (string) ($input['replace'] ?? '');
+
+    if (!$file || !is_file($file) || !is_readable($file) || !is_writable($file)) {
+        cwp_fail('File not found, not readable, or not writable.', 404);
+    }
+
+    if (!cwp_is_recoverable_php_file($file)) {
+        cwp_fail('Only PHP files inside wp-content plugins, themes, mu-plugins, and known drop-ins can be patched through connector recovery.', 403);
+    }
+
+    if ($search === '' || strlen($search) > 100000 || strlen($replace) > 100000) {
+        cwp_fail('Exact search and replacement text are required and must be reasonably sized.', 400);
+    }
+
+    $contents = (string) file_get_contents($file);
+    $matches = substr_count($contents, $search);
+    if ($matches === 0) {
+        cwp_fail('The exact search text was not found in the target file.', 400);
+    }
+
+    $limit = max(1, min(20, (int) ($input['max_replacements'] ?? 1)));
+    if ($matches > $limit) {
+        cwp_fail('The exact search text matched more times than allowed. Use a more specific search string.', 400);
+    }
+
+    $backup = cwp_backup_file($file, 'patch_file');
+    $updated = cwp_replace_limited($contents, $search, $replace, $limit);
+
+    if (@file_put_contents($file, $updated, LOCK_EX) === false) {
+        cwp_fail('Unable to write the patched file.', 500);
+    }
+
+    $details = [
+        'path' => cwp_public_path($file),
+        'backup_path' => cwp_public_path($backup),
+        'replacements' => $matches,
+        'runner' => 'cortexwp-recovery-bridge',
+    ];
+    cwp_audit('patch_file', $details, 'succeeded');
+
+    return array_merge(['patched' => true], $details);
+}
+
+function cwp_restore_file_backup(array $input): array {
+    $backup = cwp_safe_path((string) ($input['backup_path'] ?? ''));
+    $backup_dir = realpath(cwp_dir('cortexwp-recovery-backups'));
+
+    if (!$backup || !$backup_dir || !cwp_within($backup, $backup_dir) || !is_file($backup) || !is_readable($backup)) {
+        cwp_fail('Backup file was not found or is not readable.', 404);
+    }
+
+    $metadata = [];
+    if (is_readable($backup . '.json')) {
+        $decoded = json_decode((string) file_get_contents($backup . '.json'), true);
+        $metadata = is_array($decoded) ? $decoded : [];
+    }
+
+    $target = trim((string) ($input['target_path'] ?? ''));
+    $target = $target !== '' ? cwp_safe_path($target) : cwp_safe_path((string) ($metadata['target_path'] ?? ''));
+
+    if (!$target || !is_file($target) || !is_writable($target) || !cwp_is_recoverable_php_file($target)) {
+        cwp_fail('Restore target was not found, not writable, or outside recovery scope.', 404);
+    }
+
+    $pre_restore_backup = cwp_backup_file($target, 'pre_restore');
+    if (!@copy($backup, $target)) {
+        cwp_fail('Unable to restore the backup file.', 500);
+    }
+
+    $details = [
+        'target_path' => cwp_public_path($target),
+        'backup_path' => cwp_public_path($backup),
+        'pre_restore_backup_path' => cwp_public_path($pre_restore_backup),
+        'runner' => 'cortexwp-recovery-bridge',
+    ];
+    cwp_audit('restore_file_backup', $details, 'succeeded');
+
+    return array_merge(['restored' => true], $details);
+}
+
+function cwp_environment(): array {
+    $disabled = array_values(array_filter(array_map('trim', explode(',', (string) ini_get('disable_functions')))));
+
+    return [
+        'recovery_bridge' => [
+            'version' => CORTEXWP_RECOVERY_VERSION,
+            'file' => CORTEXWP_RECOVERY_FILE,
+            'root' => CORTEXWP_RECOVERY_ROOT,
+            'runner' => 'cortexwp-recovery-bridge',
+        ],
+        'php' => [
+            'version' => PHP_VERSION,
+            'sapi' => PHP_SAPI,
+            'os' => PHP_OS_FAMILY,
+            'memory_limit' => ini_get('memory_limit'),
+            'max_execution_time' => ini_get('max_execution_time'),
+            'disabled_functions' => $disabled,
+        ],
+        'writable' => [
+            'wp_content' => is_writable(CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content'),
+            'plugins' => is_writable(CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . 'plugins'),
+            'themes' => is_writable(CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . 'themes'),
+            'backup_dir' => is_dir(cwp_dir('cortexwp-recovery-backups')) ? is_writable(cwp_dir('cortexwp-recovery-backups')) : is_writable(CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content'),
+        ],
+        'scope' => [
+            'read' => 'wp-content plugin/theme/mu-plugin/drop-in PHP files and wp-content/debug.log only',
+            'write' => 'exact search/replace on recoverable PHP files only',
+            'shell' => false,
+            'database' => false,
+            'eval' => false,
+        ],
+    ];
+}
+
+$body = (string) file_get_contents('php://input');
+cwp_verify($body);
+
+$input = json_decode($body, true);
+if (!is_array($input)) {
+    cwp_fail('Invalid JSON body.', 400);
+}
+
+$action = preg_replace('/[^a-z0-9_]/i', '', (string) ($input['action'] ?? ''));
+
+try {
+    switch ($action) {
+        case 'status':
+        case 'php_environment':
+            cwp_response(cwp_environment());
+            break;
+        case 'read_file':
+            cwp_response(cwp_read_file($input));
+            break;
+        case 'list_directory':
+            cwp_response(cwp_list_directory($input));
+            break;
+        case 'patch_file':
+            cwp_response(cwp_patch_file($input));
+            break;
+        case 'restore_file_backup':
+            cwp_response(cwp_restore_file_backup($input));
+            break;
+        case 'recovery_audit_log':
+            cwp_response(cwp_audit_log((int) ($input['limit'] ?? 50)));
+            break;
+        default:
+            cwp_fail('Unknown CortexWP recovery action.', 400);
+    }
+} catch (Throwable $error) {
+    cwp_audit($action ?: 'unknown', ['error' => $error->getMessage()], 'failed');
+    cwp_fail($error->getMessage(), 500);
+}
+PHP;
+
+        return str_replace(
+            ['%%SECRET%%', '%%VERSION%%', '%%BRIDGE_FILE%%'],
+            [$secret_export, $version_export, $bridge_file_export],
+            $template
+        );
+    }
+
     private static function connector_key(): string {
         $stored = (string) get_option(self::OPTION_KEY, '');
 
@@ -1656,6 +2740,10 @@ JS;
             return $decrypted;
         }
 
+        if (strpos($stored, 'v1:') === 0) {
+            return '';
+        }
+
         self::store_key($stored);
         return $stored;
     }
@@ -1664,8 +2752,56 @@ JS;
         update_option(self::OPTION_KEY, self::encrypt_secret($key), false);
     }
 
-    private static function encryption_key(): string {
-        return hash('sha256', wp_salt('auth') . wp_salt('secure_auth'), true);
+    private static function salt_constant(string $name): string {
+        if (!defined($name)) {
+            return '';
+        }
+
+        $value = (string) constant($name);
+
+        return trim($value) === 'put your unique phrase here' ? '' : $value;
+    }
+
+    private static function fallback_salt(string $scheme): string {
+        $constants = [
+            'auth' => ['AUTH_KEY', 'AUTH_SALT'],
+            'secure_auth' => ['SECURE_AUTH_KEY', 'SECURE_AUTH_SALT'],
+        ][$scheme] ?? ['AUTH_KEY', 'AUTH_SALT'];
+        $material = '';
+
+        foreach ($constants as $constant) {
+            $material .= self::salt_constant($constant);
+        }
+
+        if ($material === '') {
+            $material = self::salt_constant('SECRET_KEY') . self::salt_constant('SECRET_SALT');
+        }
+
+        return $material;
+    }
+
+    private static function encryption_key_materials(): array {
+        $materials = [];
+
+        if (function_exists('wp_salt')) {
+            $materials[] = wp_salt('auth') . wp_salt('secure_auth');
+        }
+
+        $fallback = self::fallback_salt('auth') . self::fallback_salt('secure_auth');
+        if ($fallback !== '') {
+            $materials[] = $fallback;
+        }
+
+        return array_values(array_unique(array_filter($materials)));
+    }
+
+    private static function encryption_key(?string $material = null): string {
+        if ($material === null) {
+            $materials = self::encryption_key_materials();
+            $material = $materials[0] ?? (defined('ABSPATH') ? ABSPATH : __FILE__);
+        }
+
+        return hash('sha256', $material, true);
     }
 
     private static function encrypt_secret(string $value): string {
@@ -1701,16 +2837,22 @@ JS;
         }
 
         [, $iv, $tag, $ciphertext] = $parts;
-        $decrypted = openssl_decrypt(
-            base64_decode($ciphertext, true) ?: '',
-            'aes-256-gcm',
-            self::encryption_key(),
-            OPENSSL_RAW_DATA,
-            base64_decode($iv, true) ?: '',
-            base64_decode($tag, true) ?: ''
-        );
+        foreach (self::encryption_key_materials() as $material) {
+            $decrypted = openssl_decrypt(
+                base64_decode($ciphertext, true) ?: '',
+                'aes-256-gcm',
+                self::encryption_key($material),
+                OPENSSL_RAW_DATA,
+                base64_decode($iv, true) ?: '',
+                base64_decode($tag, true) ?: ''
+            );
 
-        return $decrypted === false ? null : $decrypted;
+            if ($decrypted !== false) {
+                return $decrypted;
+            }
+        }
+
+        return null;
     }
 
     private static function key_domain(): string {
@@ -2665,7 +3807,15 @@ JS;
         $real = realpath($candidate);
         $root = realpath(ABSPATH);
 
-        if (!$real || !$root || strpos($real, $root) !== 0) {
+        if (!$real || !$root) {
+            return '';
+        }
+
+        $normalized_real = self::normalized_real_path($real);
+        $normalized_root = self::normalized_real_path($root);
+        $root_prefix = trailingslashit($normalized_root);
+
+        if ($normalized_real !== $normalized_root && strpos($normalized_real, $root_prefix) !== 0) {
             return '';
         }
 
