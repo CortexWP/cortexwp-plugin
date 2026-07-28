@@ -19,6 +19,7 @@ final class CortexWP_AI_Connector {
     private const OPTION_KEY = 'cortexwp_ai_connector_key';
     private const OPTION_KEY_DOMAIN = 'cortexwp_ai_connector_key_domain';
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
+    private const OPTION_REDIRECT_RULES = 'cortexwp_ai_redirect_rules';
     private const ROUTE_NAMESPACE = 'cortexwp-ai/v1';
     private const SNIPPET_DIR = 'cortexwp-snippets';
     private const RECOVERY_BRIDGE_PREFIX = 'cortexwp-recovery-';
@@ -40,6 +41,7 @@ final class CortexWP_AI_Connector {
         add_action('admin_post_cortexwp_ai_toggle_snippet', [__CLASS__, 'toggle_snippet_from_admin']);
         add_action('wp_ajax_cortexwp_ai_regenerate_key', [__CLASS__, 'ajax_regenerate_key']);
         add_action('plugins_loaded', [__CLASS__, 'load_snippets'], 20);
+        add_action('template_redirect', [__CLASS__, 'maybe_redirect_request'], 0);
         add_action('rest_api_init', [__CLASS__, 'register_routes']);
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_for_plugin_update']);
         add_filter('plugins_api', [__CLASS__, 'plugin_update_details'], 10, 3);
@@ -1411,6 +1413,8 @@ JS;
                 return rest_ensure_response(self::recovery_bridge_status());
             case 'recovery_audit_log':
                 return rest_ensure_response(self::recovery_audit_log((int) ($params['limit'] ?? 50)));
+            case 'sync_redirect_rules':
+                return rest_ensure_response(self::sync_redirect_rules((array) ($params['rules'] ?? [])));
             case 'list_snippets':
                 return rest_ensure_response(['snippets' => self::list_snippets()]);
             case 'save_snippet':
@@ -1444,11 +1448,159 @@ JS;
             'native_management_available' => true,
             'fatal_error_monitor' => true,
             'fatal_error_endpoint' => self::fatal_error_endpoint(),
+            'redirect_manager' => true,
+            'redirect_rule_count' => count(self::redirect_rules()),
             'php_environment' => true,
             'safe_file_patch' => true,
             'recovery_bridge' => self::recovery_bridge_status(),
             'wp_cli_available' => self::wp_cli_available(),
         ];
+    }
+
+    private static function redirect_rules(): array {
+        $rules = get_option(self::OPTION_REDIRECT_RULES, []);
+
+        return is_array($rules) ? $rules : [];
+    }
+
+    private static function clean_redirect_source_path(string $value): string {
+        $value = trim(wp_unslash($value));
+        if ($value === '') {
+            return '';
+        }
+
+        $parts = wp_parse_url($value);
+        if (is_array($parts) && isset($parts['path'])) {
+            $path = '/' . ltrim((string) $parts['path'], '/');
+            $query = isset($parts['query']) && $parts['query'] !== '' ? '?' . (string) $parts['query'] : '';
+            return $path . $query;
+        }
+
+        return '/' . ltrim(preg_replace('/[\r\n]+/', '', $value) ?: '', '/');
+    }
+
+    private static function clean_redirect_destination(string $value): string {
+        $value = trim(wp_unslash($value));
+        if ($value === '') {
+            return '';
+        }
+
+        $value = preg_replace('/[\r\n]+/', '', $value) ?: '';
+        if (strpos($value, '/') === 0 && strpos($value, '//') !== 0) {
+            return $value;
+        }
+
+        $url = esc_url_raw($value);
+        if (!$url || !preg_match('/^https?:\/\//i', $url)) {
+            return '';
+        }
+
+        return $url;
+    }
+
+    private static function clean_redirect_rules(array $rules): array {
+        $clean = [];
+
+        foreach (array_slice($rules, 0, 1000) as $rule) {
+            if (!is_array($rule)) {
+                continue;
+            }
+
+            $source = self::clean_redirect_source_path((string) ($rule['sourcePath'] ?? $rule['source_path'] ?? ''));
+            $destination = self::clean_redirect_destination((string) ($rule['destinationUrl'] ?? $rule['destination_url'] ?? ''));
+            $status = (int) ($rule['statusCode'] ?? $rule['status_code'] ?? 301);
+
+            if ($source === '' || $destination === '' || !in_array($status, [301, 302, 307, 308], true)) {
+                continue;
+            }
+
+            $clean[] = [
+                'id' => sanitize_text_field((string) ($rule['id'] ?? '')),
+                'sourcePath' => $source,
+                'destinationUrl' => $destination,
+                'statusCode' => $status,
+                'enabled' => array_key_exists('enabled', $rule) ? (bool) $rule['enabled'] : true,
+                'updatedAt' => sanitize_text_field((string) ($rule['updatedAt'] ?? '')),
+            ];
+        }
+
+        return array_values($clean);
+    }
+
+    private static function sync_redirect_rules(array $rules): array {
+        $clean = self::clean_redirect_rules($rules);
+
+        update_option(self::OPTION_REDIRECT_RULES, $clean, false);
+
+        return [
+            'synced' => true,
+            'rules' => count($clean),
+        ];
+    }
+
+    private static function current_redirect_source_path(): string {
+        $request_uri = isset($_SERVER['REQUEST_URI']) ? (string) wp_unslash($_SERVER['REQUEST_URI']) : '/';
+        $parts = wp_parse_url($request_uri);
+        $path = is_array($parts) && isset($parts['path']) ? '/' . ltrim((string) $parts['path'], '/') : '/';
+        $query = is_array($parts) && isset($parts['query']) && $parts['query'] !== '' ? '?' . (string) $parts['query'] : '';
+
+        return $path . $query;
+    }
+
+    private static function redirect_destination_matches_request(string $destination, string $request_path): bool {
+        if (strpos($destination, '/') === 0 && strpos($destination, '//') !== 0) {
+            return $destination === $request_path;
+        }
+
+        $destination_parts = wp_parse_url($destination);
+        if (!is_array($destination_parts) || empty($destination_parts['path'])) {
+            return false;
+        }
+
+        $path = '/' . ltrim((string) $destination_parts['path'], '/');
+        $query = isset($destination_parts['query']) && $destination_parts['query'] !== '' ? '?' . (string) $destination_parts['query'] : '';
+
+        return $path . $query === $request_path;
+    }
+
+    public static function maybe_redirect_request(): void {
+        if (
+            is_admin() ||
+            wp_doing_ajax() ||
+            wp_doing_cron() ||
+            (defined('REST_REQUEST') && REST_REQUEST) ||
+            (defined('WP_CLI') && WP_CLI)
+        ) {
+            return;
+        }
+
+        $method = strtoupper(isset($_SERVER['REQUEST_METHOD']) ? (string) $_SERVER['REQUEST_METHOD'] : 'GET');
+        if ($method !== 'GET' && $method !== 'HEAD') {
+            return;
+        }
+
+        $request_path = self::current_redirect_source_path();
+        $request_path_without_query = strtok($request_path, '?') ?: $request_path;
+
+        foreach (self::redirect_rules() as $rule) {
+            if (!is_array($rule) || empty($rule['enabled'])) {
+                continue;
+            }
+
+            $source = (string) ($rule['sourcePath'] ?? '');
+            if ($source !== $request_path && $source !== $request_path_without_query) {
+                continue;
+            }
+
+            $destination = (string) ($rule['destinationUrl'] ?? '');
+            if ($destination === '' || self::redirect_destination_matches_request($destination, $request_path)) {
+                continue;
+            }
+
+            header('X-Redirected-By: CortexWP');
+            wp_redirect($destination, (int) ($rule['statusCode'] ?? 301), 'CortexWP');
+            exit;
+        }
     }
 
     private static function save_app_url(string $value): void {
