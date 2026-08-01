@@ -1407,6 +1407,22 @@ JS;
                     (string) ($params['backup_path'] ?? ''),
                     (string) ($params['target_path'] ?? '')
                 ));
+            case 'component_backup_upload':
+                $result = self::component_backup_upload(
+                    (string) ($params['type'] ?? ''),
+                    (string) ($params['target'] ?? ''),
+                    (string) ($params['upload_url'] ?? '')
+                );
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
+            case 'component_backup_restore':
+                $result = self::component_backup_restore(
+                    (string) ($params['type'] ?? ''),
+                    (string) ($params['target'] ?? ''),
+                    (string) ($params['download_url'] ?? ''),
+                    (string) ($params['sha256'] ?? ''),
+                    (string) ($params['source_path'] ?? '')
+                );
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
             case 'recovery_bridge_install':
                 return rest_ensure_response(self::ensure_recovery_bridge(true));
             case 'recovery_bridge_status':
@@ -1447,6 +1463,514 @@ JS;
         return new WP_Error('cortexwp_ai_unknown_action', 'Unknown CortexWP action.', ['status' => 400]);
     }
 
+    private static function normalize_component_type(string $type): string {
+        $type = sanitize_key($type);
+        return in_array($type, ['plugin', 'theme'], true) ? $type : '';
+    }
+
+    private static function resolve_theme_target(string $target): ?array {
+        $needle = strtolower(trim($target));
+        if ($needle === '') {
+            return null;
+        }
+
+        foreach (wp_get_themes() as $slug => $theme) {
+            $path = $theme->get_stylesheet_directory();
+            $aliases = array_filter([
+                (string) $slug,
+                (string) $theme->get('Name'),
+                (string) $theme->get_stylesheet(),
+                (string) $theme->get_template(),
+                (string) $path,
+            ]);
+
+            foreach ($aliases as $alias) {
+                if (strtolower((string) $alias) === $needle) {
+                    return [
+                        'name' => (string) $slug,
+                        'title' => (string) $theme->get('Name'),
+                        'version' => (string) $theme->get('Version'),
+                        'source_path' => (string) $path,
+                        'kind' => 'theme',
+                    ];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static function component_source_from_target(string $type, string $target) {
+        $type = self::normalize_component_type($type);
+
+        if ($type === '') {
+            return new WP_Error('cortexwp_ai_component_type', 'Component type must be plugin or theme.', ['status' => 400]);
+        }
+
+        if ($type === 'plugin') {
+            $plugin = self::resolve_plugin_target($target, false);
+            if (!$plugin || (string) ($plugin['kind'] ?? '') !== 'plugin') {
+                return new WP_Error('cortexwp_ai_component_not_found', 'Plugin not found for backup.', ['status' => 404]);
+            }
+
+            $file = (string) $plugin['plugin_file'];
+            $source = strpos($file, '/') !== false
+                ? trailingslashit(WP_PLUGIN_DIR) . dirname($file)
+                : trailingslashit(WP_PLUGIN_DIR) . $file;
+
+            return [
+                'type' => 'plugin',
+                'name' => (string) $plugin['name'],
+                'title' => (string) $plugin['title'],
+                'version' => (string) $plugin['version'],
+                'source_path' => $source,
+                'root_path' => WP_PLUGIN_DIR,
+            ];
+        }
+
+        $theme = self::resolve_theme_target($target);
+        if (!$theme) {
+            return new WP_Error('cortexwp_ai_component_not_found', 'Theme not found for backup.', ['status' => 404]);
+        }
+
+        return [
+            'type' => 'theme',
+            'name' => (string) $theme['name'],
+            'title' => (string) $theme['title'],
+            'version' => (string) $theme['version'],
+            'source_path' => (string) $theme['source_path'],
+            'root_path' => get_theme_root((string) $theme['name']),
+        ];
+    }
+
+    private static function component_source_from_backup_path(string $type, string $target, string $source_path) {
+        $resolved = self::component_source_from_target($type, $target);
+        if (!is_wp_error($resolved)) {
+            return $resolved;
+        }
+
+        $type = self::normalize_component_type($type);
+        $source_path = trim($source_path);
+        if ($type === '' || $source_path === '') {
+            return $resolved;
+        }
+
+        $root = $type === 'plugin'
+            ? realpath(WP_PLUGIN_DIR)
+            : realpath(get_theme_root());
+        $parent = realpath(dirname($source_path));
+        $base = basename($source_path);
+
+        if (!$root || !$parent || $base === '' || $base === '.' || $base === '..') {
+            return $resolved;
+        }
+
+        if (!self::path_is_within_or_equal($parent, $root)) {
+            return $resolved;
+        }
+
+        return [
+            'type' => $type,
+            'name' => $base,
+            'title' => $base,
+            'version' => '',
+            'source_path' => trailingslashit($parent) . $base,
+            'root_path' => $root,
+        ];
+    }
+
+    private static function path_is_within_or_equal(string $path, string $directory): bool {
+        $real_path = realpath($path);
+        $real_directory = realpath($directory);
+
+        if (!$real_path || !$real_directory) {
+            return false;
+        }
+
+        $normalized_path = self::normalized_real_path($real_path);
+        $normalized_directory = self::normalized_real_path($real_directory);
+
+        return $normalized_path === $normalized_directory
+            || strpos($normalized_path, trailingslashit($normalized_directory)) === 0;
+    }
+
+    private static function assert_component_source(array $component) {
+        $source = realpath((string) ($component['source_path'] ?? ''));
+        $root = realpath((string) ($component['root_path'] ?? ''));
+
+        if (!$source || !$root || !file_exists($source) || !is_readable($source)) {
+            return new WP_Error('cortexwp_ai_component_source', 'Component source was not found or is not readable.', ['status' => 404]);
+        }
+
+        if (!self::path_is_within($source, $root)) {
+            return new WP_Error('cortexwp_ai_component_scope', 'Component source is outside the allowed WordPress directory.', ['status' => 403]);
+        }
+
+        return $source;
+    }
+
+    private static function assert_component_restore_target(array $component) {
+        $source_path = (string) ($component['source_path'] ?? '');
+        $root = realpath((string) ($component['root_path'] ?? ''));
+        $parent = realpath(dirname($source_path));
+        $base = basename($source_path);
+
+        if (!$root || !$parent || $base === '' || $base === '.' || $base === '..') {
+            return new WP_Error('cortexwp_ai_component_target', 'Component restore target is invalid.', ['status' => 400]);
+        }
+
+        if (!self::path_is_within_or_equal($parent, $root)) {
+            return new WP_Error('cortexwp_ai_component_scope', 'Component restore target is outside the allowed WordPress directory.', ['status' => 403]);
+        }
+
+        $target = trailingslashit($parent) . $base;
+        if (file_exists($target)) {
+            $real_target = realpath($target);
+            if (!$real_target || !self::path_is_within_or_equal($real_target, $root)) {
+                return new WP_Error('cortexwp_ai_component_scope', 'Component restore target is outside the allowed WordPress directory.', ['status' => 403]);
+            }
+
+            return $real_target;
+        }
+
+        return $target;
+    }
+
+    private static function component_temp_dir(string $prefix) {
+        $dir = trailingslashit(WP_CONTENT_DIR) . 'cortexwp-update-archives';
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            return new WP_Error('cortexwp_ai_archive_dir', 'Unable to create the component archive directory.', ['status' => 500]);
+        }
+
+        if (!is_writable($dir)) {
+            return new WP_Error('cortexwp_ai_archive_dir', 'The component archive directory is not writable.', ['status' => 500]);
+        }
+
+        $tmp = trailingslashit($dir) . sanitize_file_name($prefix) . '-' . wp_generate_uuid4();
+        if (!wp_mkdir_p($tmp)) {
+            return new WP_Error('cortexwp_ai_archive_dir', 'Unable to create a temporary archive directory.', ['status' => 500]);
+        }
+
+        return $tmp;
+    }
+
+    private static function ensure_pclzip() {
+        if (!class_exists('PclZip')) {
+            require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
+        }
+
+        return class_exists('PclZip');
+    }
+
+    private static function create_component_zip(string $source, string $tmp_dir) {
+        if (!self::ensure_pclzip()) {
+            return new WP_Error('cortexwp_ai_zip_unavailable', 'WordPress PclZip is not available.', ['status' => 500]);
+        }
+
+        $archive_path = trailingslashit($tmp_dir) . 'component.zip';
+        $archive = new PclZip($archive_path);
+        $result = $archive->create($source, PCLZIP_OPT_REMOVE_PATH, dirname($source));
+
+        if ($result === 0 || !is_file($archive_path)) {
+            return new WP_Error('cortexwp_ai_zip_failed', 'Unable to create the component archive: ' . $archive->errorInfo(true), ['status' => 500]);
+        }
+
+        return $archive_path;
+    }
+
+    private static function upload_file_to_signed_url(string $file, string $url) {
+        if (!preg_match('/^https:\/\//i', $url)) {
+            return new WP_Error('cortexwp_ai_upload_url', 'Backup upload URL must use HTTPS.', ['status' => 400]);
+        }
+
+        if (!is_file($file) || !is_readable($file)) {
+            return new WP_Error('cortexwp_ai_upload_file', 'Backup archive is not readable.', ['status' => 500]);
+        }
+
+        if (function_exists('curl_init')) {
+            $handle = fopen($file, 'rb');
+            if (!$handle) {
+                return new WP_Error('cortexwp_ai_upload_file', 'Unable to open backup archive for upload.', ['status' => 500]);
+            }
+
+            $curl = curl_init($url);
+            curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'PUT');
+            curl_setopt($curl, CURLOPT_UPLOAD, true);
+            curl_setopt($curl, CURLOPT_INFILE, $handle);
+            curl_setopt($curl, CURLOPT_INFILESIZE, filesize($file));
+            curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($curl, CURLOPT_TIMEOUT, 600);
+            $body = curl_exec($curl);
+            $code = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+            $error = curl_error($curl);
+            curl_close($curl);
+            fclose($handle);
+
+            if ($body === false || $code < 200 || $code >= 300) {
+                return new WP_Error('cortexwp_ai_upload_failed', trim($error . ' HTTP ' . $code . ' ' . (string) $body), ['status' => 502]);
+            }
+
+            return true;
+        }
+
+        $body = file_get_contents($file);
+        if ($body === false) {
+            return new WP_Error('cortexwp_ai_upload_file', 'Unable to read backup archive for upload.', ['status' => 500]);
+        }
+
+        $response = wp_remote_request($url, [
+            'method' => 'PUT',
+            'timeout' => 600,
+            'body' => $body,
+            'headers' => [
+                'Content-Length' => (string) strlen($body),
+            ],
+        ]);
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $code = (int) wp_remote_retrieve_response_code($response);
+        if ($code < 200 || $code >= 300) {
+            return new WP_Error('cortexwp_ai_upload_failed', 'R2 upload failed with HTTP ' . $code . '.', ['status' => 502]);
+        }
+
+        return true;
+    }
+
+    private static function delete_tree(string $path): bool {
+        if (is_link($path) || is_file($path)) {
+            return @unlink($path);
+        }
+
+        if (!is_dir($path)) {
+            return true;
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST
+        );
+
+        foreach ($iterator as $item) {
+            $item_path = $item->getPathname();
+            if ($item->isDir() && !$item->isLink()) {
+                @rmdir($item_path);
+            } else {
+                @unlink($item_path);
+            }
+        }
+
+        return @rmdir($path);
+    }
+
+    private static function archive_top_level_name(string $archive_path) {
+        if (!self::ensure_pclzip()) {
+            return new WP_Error('cortexwp_ai_zip_unavailable', 'WordPress PclZip is not available.', ['status' => 500]);
+        }
+
+        $archive = new PclZip($archive_path);
+        $entries = $archive->listContent();
+        if (!is_array($entries) || !$entries) {
+            return new WP_Error('cortexwp_ai_zip_invalid', 'Backup archive is empty or invalid.', ['status' => 400]);
+        }
+
+        $top = [];
+        foreach ($entries as $entry) {
+            $raw_name = str_replace('\\', '/', (string) ($entry['filename'] ?? ''));
+            if ($raw_name === '' || preg_match('#(^/|^[A-Za-z]:/|(^|/)\.\.(?:/|$))#', $raw_name)) {
+                return new WP_Error('cortexwp_ai_zip_invalid', 'Backup archive contains unsafe paths.', ['status' => 400]);
+            }
+
+            $name = trim($raw_name, '/');
+            if ($name === '' || $name === '.' || strpos($name, './') === 0 || strpos($name, '/./') !== false) {
+                return new WP_Error('cortexwp_ai_zip_invalid', 'Backup archive contains unsafe paths.', ['status' => 400]);
+            }
+
+            $top_name = explode('/', $name)[0] ?? '';
+            if ($top_name !== '') {
+                $top[$top_name] = true;
+            }
+        }
+
+        if (count($top) !== 1) {
+            return new WP_Error('cortexwp_ai_zip_invalid', 'Backup archive must contain exactly one top-level item.', ['status' => 400]);
+        }
+
+        return (string) array_key_first($top);
+    }
+
+    private static function extract_component_zip(string $archive_path, string $tmp_dir) {
+        $top = self::archive_top_level_name($archive_path);
+        if (is_wp_error($top)) {
+            return $top;
+        }
+
+        $extract_dir = trailingslashit($tmp_dir) . 'extract';
+        if (!wp_mkdir_p($extract_dir)) {
+            return new WP_Error('cortexwp_ai_extract_dir', 'Unable to create the restore extraction directory.', ['status' => 500]);
+        }
+
+        $archive = new PclZip($archive_path);
+        $result = $archive->extract(PCLZIP_OPT_PATH, $extract_dir);
+        if ($result === 0) {
+            return new WP_Error('cortexwp_ai_extract_failed', 'Unable to extract backup archive: ' . $archive->errorInfo(true), ['status' => 500]);
+        }
+
+        $restored = trailingslashit($extract_dir) . $top;
+        if (!file_exists($restored)) {
+            return new WP_Error('cortexwp_ai_extract_failed', 'Backup archive did not extract the expected component.', ['status' => 500]);
+        }
+
+        return $restored;
+    }
+
+    private static function component_backup_upload(string $type, string $target, string $upload_url) {
+        $component = self::component_source_from_target($type, $target);
+        if (is_wp_error($component)) {
+            return $component;
+        }
+
+        $source = self::assert_component_source($component);
+        if (is_wp_error($source)) {
+            return $source;
+        }
+
+        $tmp = self::component_temp_dir('backup');
+        if (is_wp_error($tmp)) {
+            return $tmp;
+        }
+
+        try {
+            $archive = self::create_component_zip($source, $tmp);
+            if (is_wp_error($archive)) {
+                return $archive;
+            }
+
+            $uploaded = self::upload_file_to_signed_url($archive, $upload_url);
+            if (is_wp_error($uploaded)) {
+                return $uploaded;
+            }
+
+            $details = [
+                'archive_format' => 'zip',
+                'name' => (string) $component['name'],
+                'title' => (string) $component['title'],
+                'type' => (string) $component['type'],
+                'version' => (string) $component['version'],
+                'source_path' => $source,
+                'source_public_path' => self::public_site_path($source),
+                'size_bytes' => filesize($archive) ?: 0,
+                'sha256' => hash_file('sha256', $archive) ?: '',
+                'runner' => 'wordpress-native',
+            ];
+            self::append_recovery_audit('component_backup_upload', [
+                'type' => $details['type'],
+                'name' => $details['name'],
+                'source_path' => $details['source_public_path'],
+                'size_bytes' => $details['size_bytes'],
+            ]);
+
+            return $details;
+        } finally {
+            self::delete_tree($tmp);
+        }
+    }
+
+    private static function component_backup_restore(string $type, string $target, string $download_url, string $sha256 = '', string $source_path = '') {
+        if (!preg_match('/^https:\/\//i', $download_url)) {
+            return new WP_Error('cortexwp_ai_download_url', 'Backup download URL must use HTTPS.', ['status' => 400]);
+        }
+
+        $component = self::component_source_from_backup_path($type, $target, $source_path);
+        if (is_wp_error($component)) {
+            return $component;
+        }
+
+        $target_path = self::assert_component_restore_target($component);
+        if (is_wp_error($target_path)) {
+            return $target_path;
+        }
+
+        if (!is_writable(dirname($target_path)) || (file_exists($target_path) && !is_writable($target_path))) {
+            return new WP_Error('cortexwp_ai_restore_writable', 'Component target is not writable.', ['status' => 500]);
+        }
+
+        if (!function_exists('download_url')) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+
+        $tmp = self::component_temp_dir('restore');
+        if (is_wp_error($tmp)) {
+            return $tmp;
+        }
+
+        try {
+            $downloaded = download_url($download_url, 600);
+            if (is_wp_error($downloaded)) {
+                return $downloaded;
+            }
+
+            $archive = trailingslashit($tmp) . 'component.zip';
+            if (!@rename($downloaded, $archive)) {
+                @unlink($downloaded);
+                return new WP_Error('cortexwp_ai_download_failed', 'Unable to store downloaded backup archive.', ['status' => 500]);
+            }
+
+            $sha256 = trim(strtolower($sha256));
+            if ($sha256 !== '') {
+                $actual = strtolower((string) hash_file('sha256', $archive));
+                if (!hash_equals($sha256, $actual)) {
+                    return new WP_Error('cortexwp_ai_checksum', 'Backup checksum mismatch.', ['status' => 400]);
+                }
+            }
+
+            $restored = self::extract_component_zip($archive, $tmp);
+            if (is_wp_error($restored)) {
+                return $restored;
+            }
+
+            $current = trailingslashit($tmp) . 'current';
+            if (file_exists($target_path) && !@rename($target_path, $current)) {
+                return new WP_Error('cortexwp_ai_restore_move', 'Unable to move the current component before restore.', ['status' => 500]);
+            }
+
+            if (!@rename($restored, $target_path)) {
+                if (file_exists($current)) {
+                    @rename($current, $target_path);
+                }
+
+                return new WP_Error('cortexwp_ai_restore_move', 'Unable to move restored component into place.', ['status' => 500]);
+            }
+
+            if (file_exists($current)) {
+                self::delete_tree($current);
+            }
+
+            $details = [
+                'restored' => true,
+                'archive_format' => 'zip',
+                'name' => (string) $component['name'],
+                'title' => (string) $component['title'],
+                'type' => (string) $component['type'],
+                'target_path' => $target_path,
+                'target_public_path' => self::public_site_path($target_path),
+                'sha256' => hash_file('sha256', $archive) ?: '',
+                'runner' => 'wordpress-native',
+            ];
+            self::append_recovery_audit('component_backup_restore', [
+                'type' => $details['type'],
+                'name' => $details['name'],
+                'target_path' => $details['target_public_path'],
+            ]);
+
+            return $details;
+        } finally {
+            self::delete_tree($tmp);
+        }
+    }
+
     private static function capabilities(): array {
         return [
             'can_write_wp_content' => is_writable(WP_CONTENT_DIR),
@@ -1461,6 +1985,7 @@ JS;
             'redirect_rule_count' => count(self::redirect_rules()),
             'php_environment' => true,
             'safe_file_patch' => true,
+            'component_backups' => true,
             'recovery_bridge' => self::recovery_bridge_status(),
             'wp_cli_available' => self::wp_cli_available(),
         ];
@@ -3603,6 +4128,9 @@ PHP;
 
             $items[] = [
                 'name' => $plugin['name'],
+                'title' => $plugin['title'],
+                'plugin_file' => $plugin['plugin_file'],
+                'kind' => $kind,
                 'status' => $status,
                 'version' => $plugin['version'] ?: 'unknown',
                 'update' => $update ? 'available' : 'none',
@@ -3647,6 +4175,7 @@ PHP;
             $update = isset($updates[$slug]) ? $updates[$slug] : null;
             $items[] = [
                 'name' => (string) $slug,
+                'title' => (string) $theme->get('Name'),
                 'status' => (string) $slug === $active ? 'active' : 'inactive',
                 'version' => (string) $theme->get('Version') ?: 'unknown',
                 'update' => $update ? 'available' : 'none',
