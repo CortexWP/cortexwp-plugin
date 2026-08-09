@@ -34,6 +34,7 @@ final class CortexWP_AI_Connector {
     private const DEFAULT_APP_URL = 'http://127.0.0.1:3000';
     private const FATAL_ERROR_ENDPOINT_PATH = '/api/wordpress/fatal-error';
     private static $reserved_memory = '';
+    private static $login_rate_limited = false;
     private static $rate_limit_logged = false;
 
     public static function boot(): void {
@@ -475,6 +476,10 @@ final class CortexWP_AI_Connector {
             return $error;
         }
 
+        if (self::$login_rate_limited) {
+            return __('Too many login attempts. Please wait and try again.', 'cortexwp-ai');
+        }
+
         return __('The login details were not accepted. Please check them and try again.', 'cortexwp-ai');
     }
 
@@ -548,6 +553,8 @@ final class CortexWP_AI_Connector {
         $blocked_until = (int) ($state['until'] ?? 0);
 
         if ($blocked_until > time()) {
+            self::$login_rate_limited = true;
+
             if (!self::$rate_limit_logged) {
                 self::$rate_limit_logged = true;
                 self::record_login_event(false, $username, null, 'rate_limited');
