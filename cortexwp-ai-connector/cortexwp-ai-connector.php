@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.2
+ * Version: 1.3
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -19,17 +19,22 @@ final class CortexWP_AI_Connector {
     private const OPTION_KEY = 'cortexwp_ai_connector_key';
     private const OPTION_KEY_DOMAIN = 'cortexwp_ai_connector_key_domain';
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
+    private const OPTION_SECURITY_HARDENING = 'cortexwp_ai_security_hardening';
+    private const OPTION_LOGIN_TABLE_VERSION = 'cortexwp_ai_login_table_version';
     private const OPTION_REDIRECT_RULES = 'cortexwp_ai_redirect_rules';
     private const ROUTE_NAMESPACE = 'cortexwp-ai/v1';
     private const SNIPPET_DIR = 'cortexwp-snippets';
     private const RECOVERY_BRIDGE_PREFIX = 'cortexwp-recovery-';
     private const RECOVERY_BACKUP_DIR = 'cortexwp-recovery-backups';
     private const RECOVERY_AUDIT_DIR = 'cortexwp-recovery-audit';
+    private const SITE_HEALTH_CACHE_KEY = 'cortexwp_ai_site_health_cache_v1';
+    private const LOGIN_TABLE_VERSION = '2';
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
     private const DEFAULT_APP_URL = 'http://127.0.0.1:3000';
     private const FATAL_ERROR_ENDPOINT_PATH = '/api/wordpress/fatal-error';
     private static $reserved_memory = '';
+    private static $rate_limit_logged = false;
 
     public static function boot(): void {
         self::$reserved_memory = str_repeat('x', 262144);
@@ -41,8 +46,22 @@ final class CortexWP_AI_Connector {
         add_action('admin_post_cortexwp_ai_toggle_snippet', [__CLASS__, 'toggle_snippet_from_admin']);
         add_action('wp_ajax_cortexwp_ai_regenerate_key', [__CLASS__, 'ajax_regenerate_key']);
         add_action('plugins_loaded', [__CLASS__, 'load_snippets'], 20);
+        add_action('init', [__CLASS__, 'maybe_upgrade_security_storage'], 1);
+        add_action('send_headers', [__CLASS__, 'send_security_headers'], 1);
         add_action('template_redirect', [__CLASS__, 'maybe_redirect_request'], 0);
+        add_action('template_redirect', [__CLASS__, 'maybe_block_author_enumeration'], 1);
         add_action('rest_api_init', [__CLASS__, 'register_routes']);
+        add_action('wp_login', [__CLASS__, 'log_successful_login'], 10, 2);
+        add_action('wp_login_failed', [__CLASS__, 'log_failed_login'], 10, 1);
+        add_filter('authenticate', [__CLASS__, 'maybe_rate_limit_login'], 20, 3);
+        add_filter('login_errors', [__CLASS__, 'mask_login_errors']);
+        add_filter('rest_authentication_errors', [__CLASS__, 'block_rest_user_listing']);
+        add_filter('the_generator', [__CLASS__, 'hide_wordpress_generator'], 99);
+        add_filter('script_loader_src', [__CLASS__, 'strip_asset_version'], 9999);
+        add_filter('style_loader_src', [__CLASS__, 'strip_asset_version'], 9999);
+        add_filter('xmlrpc_enabled', [__CLASS__, 'xmlrpc_enabled']);
+        add_filter('wp_is_application_passwords_available', [__CLASS__, 'application_passwords_available']);
+        add_filter('map_meta_cap', [__CLASS__, 'block_file_editor_caps'], 10, 4);
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_for_plugin_update']);
         add_filter('plugins_api', [__CLASS__, 'plugin_update_details'], 10, 3);
         register_shutdown_function([__CLASS__, 'capture_fatal_error']);
@@ -66,7 +85,17 @@ final class CortexWP_AI_Connector {
         }
 
         self::ensure_snippet_dir();
+        self::ensure_login_events_table();
         self::ensure_recovery_bridge(true);
+    }
+
+    public static function uninstall(): void {
+        global $wpdb;
+
+        $wpdb->query('DROP TABLE IF EXISTS ' . self::login_events_table());
+        delete_option(self::OPTION_LOGIN_TABLE_VERSION);
+        delete_option(self::OPTION_SECURITY_HARDENING);
+        delete_transient(self::SITE_HEALTH_CACHE_KEY);
     }
 
     private static function maybe_ensure_recovery_bridge(): void {
@@ -122,6 +151,110 @@ final class CortexWP_AI_Connector {
     private static function connector_settings(): array {
         $settings = get_option(self::OPTION_SETTINGS, []);
         return is_array($settings) ? $settings : [];
+    }
+
+    private static function default_hardening_settings(): array {
+        return [
+            'hide_wp_version' => false,
+            'block_user_enumeration' => false,
+            'mask_login_errors' => false,
+            'disable_file_editor' => false,
+            'security_headers' => false,
+            'rate_limit_login' => false,
+            'disable_xml_rpc' => false,
+            'block_rest_user_listing' => false,
+            'disable_application_passwords' => false,
+        ];
+    }
+
+    private static function hardening_settings(): array {
+        $settings = get_option(self::OPTION_SECURITY_HARDENING, []);
+        return array_merge(self::default_hardening_settings(), is_array($settings) ? $settings : []);
+    }
+
+    private static function hardening_enabled(string $key): bool {
+        $settings = self::hardening_settings();
+        return !empty($settings[$key]);
+    }
+
+    private static function hardening_definitions(): array {
+        return [
+            [
+                'key' => 'hide_wp_version',
+                'title' => 'Hide WordPress version details',
+                'description' => 'Removes version hints from public HTML, feeds, and loaded assets so automated scanners have less information to work with.',
+                'category' => 'Public surface',
+            ],
+            [
+                'key' => 'block_user_enumeration',
+                'title' => 'Block author discovery',
+                'description' => 'Stops common author archive probes that bots use to collect usernames before password attacks.',
+                'category' => 'Login protection',
+            ],
+            [
+                'key' => 'block_rest_user_listing',
+                'title' => 'Restrict REST user listings',
+                'description' => 'Keeps unauthenticated visitors from reading WordPress user lists through the REST API.',
+                'category' => 'Login protection',
+            ],
+            [
+                'key' => 'mask_login_errors',
+                'title' => 'Use generic login errors',
+                'description' => 'Shows one neutral message for failed sign-ins so attackers cannot tell whether a username exists.',
+                'category' => 'Login protection',
+            ],
+            [
+                'key' => 'rate_limit_login',
+                'title' => 'Slow repeated login failures',
+                'description' => 'Temporarily throttles repeated failed sign-ins from the same source to reduce brute-force pressure.',
+                'category' => 'Login protection',
+            ],
+            [
+                'key' => 'disable_file_editor',
+                'title' => 'Disable dashboard file editing',
+                'description' => 'Removes direct plugin and theme code editing from wp-admin to limit damage from a compromised admin account.',
+                'category' => 'Admin safety',
+            ],
+            [
+                'key' => 'security_headers',
+                'title' => 'Send baseline security headers',
+                'description' => 'Adds practical browser headers for clickjacking, content sniffing, referrer handling, and browser permission boundaries.',
+                'category' => 'Browser protection',
+            ],
+            [
+                'key' => 'disable_xml_rpc',
+                'title' => 'Disable XML-RPC',
+                'description' => 'Turns off the legacy XML-RPC interface often abused for brute-force and pingback attacks. Leave it off if you rely on Jetpack or the mobile app.',
+                'category' => 'Public surface',
+            ],
+            [
+                'key' => 'disable_application_passwords',
+                'title' => 'Disable application passwords',
+                'description' => 'Prevents new REST API application-password access when your site does not need external password-based integrations.',
+                'category' => 'API access',
+            ],
+        ];
+    }
+
+    private static function public_hardening_state(): array {
+        $settings = self::hardening_settings();
+        $options = array_map(static function (array $definition) use ($settings): array {
+            return $definition + [
+                'enabled' => !empty($settings[$definition['key']]),
+            ];
+        }, self::hardening_definitions());
+
+        return [
+            'settings' => $settings,
+            'options' => $options,
+            'updatedAt' => gmdate('c'),
+        ];
+    }
+
+    public static function maybe_upgrade_security_storage(): void {
+        if (get_option(self::OPTION_LOGIN_TABLE_VERSION) !== self::LOGIN_TABLE_VERSION) {
+            self::ensure_login_events_table();
+        }
     }
 
     private static function cortexwp_app_url(): string {
@@ -317,12 +450,557 @@ final class CortexWP_AI_Connector {
     }
 
     private static function client_ip_hash(): ?string {
-        $ip = self::safe_server_value('REMOTE_ADDR', 128);
+        $ip = self::client_ip();
         if (!$ip) {
             return null;
         }
 
         return hash_hmac('sha256', $ip, self::connector_key());
+    }
+
+    public static function hide_wordpress_generator(string $value): string {
+        return self::hardening_enabled('hide_wp_version') ? '' : $value;
+    }
+
+    public static function strip_asset_version(string $src): string {
+        if (!self::hardening_enabled('hide_wp_version')) {
+            return $src;
+        }
+
+        return remove_query_arg('ver', $src);
+    }
+
+    public static function mask_login_errors(string $error): string {
+        if (!self::hardening_enabled('mask_login_errors')) {
+            return $error;
+        }
+
+        return __('The login details were not accepted. Please check them and try again.', 'cortexwp-ai');
+    }
+
+    public static function xmlrpc_enabled(bool $enabled): bool {
+        return self::hardening_enabled('disable_xml_rpc') ? false : $enabled;
+    }
+
+    public static function application_passwords_available(bool $available): bool {
+        return self::hardening_enabled('disable_application_passwords') ? false : $available;
+    }
+
+    public static function block_file_editor_caps(array $caps, string $cap, int $user_id, array $args): array {
+        if (!self::hardening_enabled('disable_file_editor')) {
+            return $caps;
+        }
+
+        if (in_array($cap, ['edit_plugins', 'edit_themes', 'edit_files'], true)) {
+            return ['do_not_allow'];
+        }
+
+        return $caps;
+    }
+
+    public static function send_security_headers(): void {
+        if (!self::hardening_enabled('security_headers') || headers_sent()) {
+            return;
+        }
+
+        header('X-Frame-Options: SAMEORIGIN');
+        header('X-Content-Type-Options: nosniff');
+        header('Referrer-Policy: strict-origin-when-cross-origin');
+        header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+    }
+
+    public static function maybe_block_author_enumeration(): void {
+        if (!self::hardening_enabled('block_user_enumeration') || is_admin()) {
+            return;
+        }
+
+        if (isset($_GET['author']) || preg_match('#/author/[^/]+/?#i', self::safe_server_value('REQUEST_URI', 2000))) {
+            wp_safe_redirect(home_url('/'), 301);
+            exit;
+        }
+    }
+
+    public static function block_rest_user_listing($result) {
+        if (!self::hardening_enabled('block_rest_user_listing') || !defined('REST_REQUEST') || !REST_REQUEST) {
+            return $result;
+        }
+
+        if (is_wp_error($result) || current_user_can('list_users')) {
+            return $result;
+        }
+
+        $uri = self::safe_server_value('REQUEST_URI', 2000);
+        if (preg_match('#/wp-json/wp/v2/users(?:/|\\?|$)#i', $uri)) {
+            return new WP_Error('cortexwp_ai_rest_users_blocked', __('User listings are not public on this site.', 'cortexwp-ai'), ['status' => 403]);
+        }
+
+        return $result;
+    }
+
+    public static function maybe_rate_limit_login($user, string $username, string $password) {
+        if (!self::hardening_enabled('rate_limit_login') || $username === '' || $password === '') {
+            return $user;
+        }
+
+        $key = self::login_rate_key();
+        $state = get_transient($key);
+        $state = is_array($state) ? $state : ['count' => 0, 'until' => 0];
+        $blocked_until = (int) ($state['until'] ?? 0);
+
+        if ($blocked_until > time()) {
+            if (!self::$rate_limit_logged) {
+                self::$rate_limit_logged = true;
+                self::record_login_event(false, $username, null, 'rate_limited');
+            }
+
+            return new WP_Error('cortexwp_ai_login_rate_limited', __('Too many login attempts. Please wait and try again.', 'cortexwp-ai'));
+        }
+
+        return $user;
+    }
+
+    public static function log_failed_login(string $username): void {
+        if (self::$rate_limit_logged) {
+            return;
+        }
+
+        self::record_login_event(false, $username, null, 'failed');
+
+        if (!self::hardening_enabled('rate_limit_login')) {
+            return;
+        }
+
+        $key = self::login_rate_key();
+        $state = get_transient($key);
+        $state = is_array($state) ? $state : ['count' => 0, 'until' => 0];
+        $count = (int) ($state['count'] ?? 0) + 1;
+        $blocked_until = $count >= 5 ? time() + 15 * MINUTE_IN_SECONDS : 0;
+
+        set_transient($key, ['count' => $count, 'until' => $blocked_until], 15 * MINUTE_IN_SECONDS);
+    }
+
+    public static function log_successful_login(string $user_login, WP_User $user): void {
+        self::record_login_event(true, $user_login, $user, 'success');
+        delete_transient(self::login_rate_key());
+    }
+
+    private static function user_from_login_hint(string $username) {
+        $username = trim($username);
+        if ($username === '') {
+            return null;
+        }
+
+        if (is_email($username)) {
+            $user = get_user_by('email', $username);
+            if ($user instanceof WP_User) {
+                return $user;
+            }
+        }
+
+        $user = get_user_by('login', $username);
+        return $user instanceof WP_User ? $user : null;
+    }
+
+    private static function primary_role(array $roles): string {
+        $roles = array_values(array_filter(array_map('sanitize_key', $roles)));
+        return $roles[0] ?? '';
+    }
+
+    private static function login_event_role_label(string $role): string {
+        if ($role === '') {
+            return '';
+        }
+
+        $roles = wp_roles();
+        $label = $roles && isset($roles->roles[$role]['name']) ? (string) $roles->roles[$role]['name'] : '';
+        return $label ?: ucwords(str_replace('_', ' ', $role));
+    }
+
+    private static function record_login_event(bool $success, string $username, ?WP_User $user, string $reason): void {
+        global $wpdb;
+
+        self::maybe_upgrade_security_storage();
+
+        if (!$user) {
+            $user = self::user_from_login_hint($username);
+        }
+
+        $roles = $user instanceof WP_User ? array_values(array_map('sanitize_key', (array) $user->roles)) : [];
+        $primary_role = self::primary_role($roles);
+        $login = $user instanceof WP_User ? (string) $user->user_login : sanitize_user($username, true);
+        $email = $user instanceof WP_User ? (string) $user->user_email : (is_email($username) ? $username : '');
+        $ip = self::client_ip();
+        $now = gmdate('Y-m-d H:i:s');
+        $payload = [
+            'id' => 0,
+            'attemptedAt' => gmdate('c'),
+            'success' => $success,
+            'reason' => $reason,
+            'username' => self::truncate_text($login ?: $username, 190),
+            'email' => self::truncate_text($email, 320),
+            'userId' => $user instanceof WP_User ? (int) $user->ID : null,
+            'roles' => $roles,
+            'roleLabel' => self::login_event_role_label($primary_role),
+            'ip' => self::truncate_text($ip, 128),
+            'location' => self::client_location(),
+            'userAgent' => self::safe_server_value('HTTP_USER_AGENT', 500),
+            'requestUri' => self::safe_server_value('REQUEST_URI', 500),
+        ];
+        $encrypted_payload = self::encrypt_security_payload($payload);
+
+        if (!is_string($encrypted_payload) || $encrypted_payload === '') {
+            return;
+        }
+
+        $wpdb->insert(
+            self::login_events_table(),
+            [
+                'attempted_at' => $now,
+                'success' => $success ? 1 : 0,
+                'username_hash' => self::security_lookup_hash($login ?: $username ?: $email),
+                'email_hash' => self::security_lookup_hash($email),
+                'role_hash' => self::security_lookup_hash($primary_role),
+                'user_id' => $user instanceof WP_User ? (int) $user->ID : null,
+                'ip_hash' => self::security_lookup_hash($ip),
+                'payload' => $encrypted_payload,
+                'created_at' => $now,
+            ],
+            ['%s', '%d', '%s', '%s', '%s', '%d', '%s', '%s', '%s']
+        );
+    }
+
+    private static function login_event_roles(): array {
+        $roles = wp_roles();
+        if (!$roles) {
+            return [];
+        }
+
+        $items = [];
+        foreach ($roles->roles as $key => $role) {
+            $items[] = [
+                'key' => (string) $key,
+                'label' => (string) ($role['name'] ?? $key),
+            ];
+        }
+
+        return $items;
+    }
+
+    private static function clean_iso_date(string $value): string {
+        $value = trim($value);
+        if ($value === '') {
+            return '';
+        }
+
+        $time = strtotime($value);
+        return $time ? gmdate('Y-m-d H:i:s', $time) : '';
+    }
+
+    private static function security_login_events(array $params): array {
+        global $wpdb;
+
+        self::maybe_upgrade_security_storage();
+
+        $page = max(1, min(100000, (int) ($params['page'] ?? 1)));
+        $per_page = max(10, min(100, (int) ($params['perPage'] ?? $params['per_page'] ?? 25)));
+        $status = sanitize_key((string) ($params['status'] ?? 'all'));
+        $search = sanitize_text_field((string) ($params['search'] ?? ''));
+        $role = sanitize_key((string) ($params['role'] ?? ''));
+        $from = self::clean_iso_date((string) ($params['from'] ?? ''));
+        $to = self::clean_iso_date((string) ($params['to'] ?? ''));
+        $where = ['1=1'];
+        $values = [];
+
+        if ($status === 'success') {
+            $where[] = 'success = %d';
+            $values[] = 1;
+        } elseif ($status === 'failed') {
+            $where[] = 'success = %d';
+            $values[] = 0;
+        }
+
+        if ($search !== '') {
+            $search_hash = self::security_lookup_hash($search);
+            $where[] = '(username_hash = %s OR email_hash = %s OR ip_hash = %s)';
+            $values[] = $search_hash;
+            $values[] = $search_hash;
+            $values[] = $search_hash;
+        }
+
+        if ($role !== '') {
+            $where[] = 'role_hash = %s';
+            $values[] = self::security_lookup_hash($role);
+        }
+
+        if ($from !== '') {
+            $where[] = 'attempted_at >= %s';
+            $values[] = $from;
+        }
+
+        if ($to !== '') {
+            $where[] = 'attempted_at <= %s';
+            $values[] = $to;
+        }
+
+        $where_sql = implode(' AND ', $where);
+        $table = self::login_events_table();
+        $count_sql = "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}";
+        $total = (int) ($values ? $wpdb->get_var($wpdb->prepare($count_sql, $values)) : $wpdb->get_var($count_sql));
+        $total_pages = max(1, (int) ceil($total / $per_page));
+        $page = min($page, $total_pages);
+        $offset = ($page - 1) * $per_page;
+        $list_values = array_merge($values, [$per_page, $offset]);
+        $list_sql = "SELECT id, attempted_at, success, payload FROM {$table} WHERE {$where_sql} ORDER BY attempted_at DESC, id DESC LIMIT %d OFFSET %d";
+        $rows = $wpdb->get_results($wpdb->prepare($list_sql, $list_values), ARRAY_A);
+        $items = [];
+
+        foreach (is_array($rows) ? $rows : [] as $row) {
+            $payload = self::decrypt_security_payload((string) ($row['payload'] ?? ''));
+            $payload['id'] = (int) ($row['id'] ?? 0);
+            $payload['attemptedAt'] = gmdate('c', strtotime((string) ($row['attempted_at'] ?? 'now')) ?: time());
+            $payload['success'] = !empty($row['success']);
+            $items[] = $payload;
+        }
+
+        return [
+            'items' => $items,
+            'page' => $page,
+            'perPage' => $per_page,
+            'total' => $total,
+            'totalPages' => $total_pages,
+            'roles' => self::login_event_roles(),
+        ];
+    }
+
+    private static function clear_security_login_events(): array {
+        global $wpdb;
+
+        self::maybe_upgrade_security_storage();
+        $deleted = (int) $wpdb->query('TRUNCATE TABLE ' . self::login_events_table());
+
+        return [
+            'cleared' => true,
+            'deleted' => $deleted,
+        ];
+    }
+
+    private static function security_check(string $id, string $status, string $title, string $description, array $meta = []): array {
+        return [
+            'id' => $id,
+            'status' => $status,
+            'title' => $title,
+            'description' => $description,
+            'meta' => $meta,
+        ];
+    }
+
+    private static function inactive_plugin_count(): int {
+        if (!function_exists('get_plugins')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        $active = array_flip((array) get_option('active_plugins', []));
+        $inactive = 0;
+        foreach (get_plugins() as $file => $plugin) {
+            if (!isset($active[$file])) {
+                $inactive += 1;
+            }
+        }
+
+        return $inactive;
+    }
+
+    private static function inactive_theme_count(): int {
+        $active = array_filter([get_stylesheet(), get_template()]);
+        $inactive = 0;
+
+        foreach (wp_get_themes() as $slug => $theme) {
+            if (!in_array((string) $slug, $active, true)) {
+                $inactive += 1;
+            }
+        }
+
+        return $inactive;
+    }
+
+    private static function core_update_available(): bool {
+        $updates = get_site_transient('update_core');
+        if (!is_object($updates) || empty($updates->updates) || !is_array($updates->updates)) {
+            return false;
+        }
+
+        foreach ($updates->updates as $update) {
+            if (is_object($update) && ($update->response ?? '') === 'upgrade') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function site_health_scan(bool $force = false): array {
+        if (!$force) {
+            $cached = get_transient(self::SITE_HEALTH_CACHE_KEY);
+            if (is_array($cached)) {
+                $cached['cacheHit'] = true;
+                return $cached;
+            }
+        }
+
+        $checks = [];
+        $home = home_url('/');
+        $site = site_url('/');
+        $uses_https = strpos($home, 'https://') === 0 && strpos($site, 'https://') === 0;
+        $checks[] = self::security_check(
+            'ssl',
+            $uses_https ? 'passed' : 'attention',
+            $uses_https ? 'HTTPS is active' : 'HTTPS is not fully active',
+            $uses_https
+                ? 'Your public WordPress URLs are using HTTPS.'
+                : 'Set both the WordPress Address and Site Address to HTTPS and confirm the certificate is valid.',
+            ['homeUrl' => $home, 'siteUrl' => $site]
+        );
+
+        $wp_version = get_bloginfo('version');
+        $core_update_available = self::core_update_available();
+        $checks[] = self::security_check(
+            'wordpress-version',
+            $core_update_available ? 'attention' : 'passed',
+            $core_update_available ? 'WordPress core has an update available' : 'WordPress core is up to date',
+            $core_update_available
+                ? 'Install the available WordPress core update after taking a backup.'
+                : 'This site is running the current WordPress core release known to WordPress.',
+            ['version' => $wp_version]
+        );
+
+        $php_supported = version_compare(PHP_VERSION, '8.2.0', '>=');
+        $checks[] = self::security_check(
+            'php-version',
+            $php_supported ? 'passed' : 'attention',
+            $php_supported ? 'PHP is on a modern supported branch' : 'PHP should be upgraded',
+            $php_supported
+                ? 'The server is running PHP ' . PHP_VERSION . '.'
+                : 'Move this site to PHP 8.2 or newer so it continues receiving security fixes.',
+            ['version' => PHP_VERSION]
+        );
+
+        $indexable = (int) get_option('blog_public', 1) === 1;
+        $checks[] = self::security_check(
+            'search-indexing',
+            $indexable ? 'passed' : 'attention',
+            $indexable ? 'Search indexing is allowed' : 'Search indexing is discouraged',
+            $indexable
+                ? 'Search engines can crawl and index the site normally.'
+                : 'WordPress is asking search engines not to index this site.',
+            ['blogPublic' => $indexable]
+        );
+
+        $debug_on = defined('WP_DEBUG') && WP_DEBUG;
+        $checks[] = self::security_check(
+            'wp-debug',
+            $debug_on ? 'attention' : 'passed',
+            $debug_on ? 'WP_DEBUG is enabled' : 'WP_DEBUG is off',
+            $debug_on
+                ? 'Turn WP_DEBUG off in production so visitors do not see sensitive errors.'
+                : 'Debug output is not being shown publicly by WordPress.',
+            ['enabled' => $debug_on]
+        );
+
+        $inactive_plugins = self::inactive_plugin_count();
+        $checks[] = self::security_check(
+            'inactive-plugins',
+            $inactive_plugins > 0 ? 'attention' : 'passed',
+            $inactive_plugins > 0
+                ? $inactive_plugins . ' inactive plugin' . ($inactive_plugins === 1 ? '' : 's') . ' installed'
+                : 'No inactive plugins installed',
+            $inactive_plugins > 0
+                ? 'Inactive plugins still leave code on disk. Remove anything you are not planning to use.'
+                : 'Only active plugin code remains in the standard plugins directory.',
+            ['count' => $inactive_plugins]
+        );
+
+        $inactive_themes = self::inactive_theme_count();
+        $checks[] = self::security_check(
+            'inactive-themes',
+            $inactive_themes > 0 ? 'attention' : 'passed',
+            $inactive_themes > 0
+                ? $inactive_themes . ' inactive theme' . ($inactive_themes === 1 ? '' : 's') . ' installed'
+                : 'No inactive themes installed',
+            $inactive_themes > 0
+                ? 'Keep only the active theme and one fallback theme if you need it.'
+                : 'Unused theme code is not sitting in the themes directory.',
+            ['count' => $inactive_themes]
+        );
+
+        $has_admin = (bool) get_user_by('login', 'admin');
+        $checks[] = self::security_check(
+            'default-admin-user',
+            $has_admin ? 'attention' : 'passed',
+            $has_admin ? 'A user named admin exists' : 'No default admin username found',
+            $has_admin
+                ? 'Bots try the username admin first. Use a unique administrator username instead.'
+                : 'The most commonly targeted default username is not present.',
+            ['exists' => $has_admin]
+        );
+
+        $file_editor_disabled = defined('DISALLOW_FILE_EDIT') && DISALLOW_FILE_EDIT || self::hardening_enabled('disable_file_editor');
+        $checks[] = self::security_check(
+            'file-editor',
+            $file_editor_disabled ? 'passed' : 'attention',
+            $file_editor_disabled ? 'Dashboard file editing is disabled' : 'Dashboard file editing is available',
+            $file_editor_disabled
+                ? 'Administrators cannot edit plugin and theme files directly from wp-admin.'
+                : 'Disable the built-in file editor to reduce risk if an admin account is compromised.',
+            ['disabled' => $file_editor_disabled]
+        );
+
+        $login_encryption_available = function_exists('openssl_encrypt') && function_exists('openssl_decrypt');
+        $checks[] = self::security_check(
+            'login-event-encryption',
+            $login_encryption_available ? 'passed' : 'attention',
+            $login_encryption_available ? 'Encrypted login logging is available' : 'Encrypted login logging is unavailable',
+            $login_encryption_available
+                ? 'The connector can encrypt login monitor records before writing them to the local WordPress table.'
+                : 'Enable the PHP OpenSSL extension so login monitor records can be stored securely.',
+            ['available' => $login_encryption_available]
+        );
+
+        $attention = array_values(array_filter($checks, static fn($check) => $check['status'] === 'attention'));
+        $passed = array_values(array_filter($checks, static fn($check) => $check['status'] === 'passed'));
+        $checked_at = gmdate('c');
+        $result = [
+            'checkedAt' => $checked_at,
+            'cachedUntil' => gmdate('c', time() + HOUR_IN_SECONDS),
+            'cacheHit' => false,
+            'summary' => [
+                'attention' => count($attention),
+                'passed' => count($passed),
+                'total' => count($checks),
+            ],
+            'attention' => $attention,
+            'passed' => $passed,
+            'checks' => $checks,
+        ];
+
+        set_transient(self::SITE_HEALTH_CACHE_KEY, $result, HOUR_IN_SECONDS);
+
+        return $result;
+    }
+
+    private static function update_hardening_settings(array $updates): array {
+        $settings = self::hardening_settings();
+        $allowed = array_keys(self::default_hardening_settings());
+
+        foreach ($allowed as $key) {
+            if (array_key_exists($key, $updates)) {
+                $settings[$key] = (bool) $updates[$key];
+            }
+        }
+
+        update_option(self::OPTION_SECURITY_HARDENING, $settings, false);
+        delete_transient(self::SITE_HEALTH_CACHE_KEY);
+
+        return self::public_hardening_state();
     }
 
     private static function component_from_file(string $file): array {
@@ -436,6 +1114,180 @@ final class CortexWP_AI_Connector {
         }
 
         return substr($value, 0, $max_length);
+    }
+
+    private static function login_events_table(): string {
+        global $wpdb;
+        return $wpdb->prefix . 'cortexwp_login_events';
+    }
+
+    private static function ensure_login_events_table(): void {
+        global $wpdb;
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+        $charset_collate = $wpdb->get_charset_collate();
+        $table = self::login_events_table();
+        $sql = "CREATE TABLE {$table} (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            attempted_at datetime NOT NULL,
+            success tinyint(1) NOT NULL DEFAULT 0,
+            username_hash char(64) NOT NULL DEFAULT '',
+            email_hash char(64) NOT NULL DEFAULT '',
+            role_hash char(64) NOT NULL DEFAULT '',
+            user_id bigint(20) unsigned DEFAULT NULL,
+            ip_hash char(64) NOT NULL DEFAULT '',
+            payload longtext NOT NULL,
+            created_at datetime NOT NULL,
+            PRIMARY KEY  (id),
+            KEY attempted_at (attempted_at),
+            KEY success_time (success, attempted_at),
+            KEY username_time (username_hash, attempted_at),
+            KEY email_time (email_hash, attempted_at),
+            KEY role_time (role_hash, attempted_at),
+            KEY user_time (user_id, attempted_at),
+            KEY ip_time (ip_hash, attempted_at)
+        ) {$charset_collate};";
+
+        dbDelta($sql);
+        update_option(self::OPTION_LOGIN_TABLE_VERSION, self::LOGIN_TABLE_VERSION, false);
+    }
+
+    private static function security_secret_material(): string {
+        $parts = [];
+
+        if (function_exists('wp_salt')) {
+            $parts[] = wp_salt('auth');
+            $parts[] = wp_salt('secure_auth');
+        }
+
+        foreach (['AUTH_KEY', 'SECURE_AUTH_KEY', 'LOGGED_IN_KEY', 'AUTH_SALT', 'SECURE_AUTH_SALT'] as $constant) {
+            if (defined($constant)) {
+                $parts[] = (string) constant($constant);
+            }
+        }
+
+        $material = implode('|', array_filter($parts));
+        return $material !== '' ? $material : self::connector_key();
+    }
+
+    private static function security_crypto_key(string $purpose): string {
+        return hash_hmac('sha256', $purpose, self::security_secret_material(), true);
+    }
+
+    private static function security_lookup_hash(string $value): string {
+        $value = strtolower(trim($value));
+        return $value === '' ? '' : hash_hmac('sha256', $value, self::security_crypto_key('lookup-v1'));
+    }
+
+    private static function encrypt_security_payload(array $payload): ?string {
+        $json = wp_json_encode($payload);
+        if (!is_string($json)) {
+            return null;
+        }
+
+        if (!function_exists('openssl_encrypt')) {
+            return null;
+        }
+
+        try {
+            $iv = random_bytes(12);
+        } catch (Throwable $exception) {
+            return null;
+        }
+
+        $tag = '';
+        $encrypted = openssl_encrypt(
+            $json,
+            'aes-256-gcm',
+            self::security_crypto_key('login-events-v1'),
+            OPENSSL_RAW_DATA,
+            $iv,
+            $tag
+        );
+
+        if (!is_string($encrypted)) {
+            return null;
+        }
+
+        return implode(':', [
+            'v1',
+            rtrim(strtr(base64_encode($iv), '+/', '-_'), '='),
+            rtrim(strtr(base64_encode($tag), '+/', '-_'), '='),
+            rtrim(strtr(base64_encode($encrypted), '+/', '-_'), '='),
+        ]);
+    }
+
+    private static function base64url_decode(string $value): string {
+        $padded = strtr($value, '-_', '+/');
+        $padding = strlen($padded) % 4;
+        if ($padding) {
+            $padded .= str_repeat('=', 4 - $padding);
+        }
+
+        $decoded = base64_decode($padded, true);
+        return is_string($decoded) ? $decoded : '';
+    }
+
+    private static function decrypt_security_payload(string $value): array {
+        $parts = explode(':', $value);
+        if (count($parts) !== 4 || $parts[0] !== 'v1' || !function_exists('openssl_decrypt')) {
+            return [];
+        }
+
+        [, $iv, $tag, $encrypted] = $parts;
+        $json = openssl_decrypt(
+            self::base64url_decode($encrypted),
+            'aes-256-gcm',
+            self::security_crypto_key('login-events-v1'),
+            OPENSSL_RAW_DATA,
+            self::base64url_decode($iv),
+            self::base64url_decode($tag)
+        );
+        $decoded = is_string($json) ? json_decode($json, true) : null;
+
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    private static function valid_ip(string $value): string {
+        $value = trim($value);
+        return filter_var($value, FILTER_VALIDATE_IP) ? $value : '';
+    }
+
+    private static function client_ip(): string {
+        foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_TRUE_CLIENT_IP'] as $key) {
+            $ip = self::valid_ip(self::safe_server_value($key, 128));
+            if ($ip !== '') {
+                return $ip;
+            }
+        }
+
+        $forwarded = self::safe_server_value('HTTP_X_FORWARDED_FOR', 500);
+        foreach (explode(',', $forwarded) as $candidate) {
+            $ip = self::valid_ip($candidate);
+            if ($ip !== '') {
+                return $ip;
+            }
+        }
+
+        return self::valid_ip(self::safe_server_value('REMOTE_ADDR', 128));
+    }
+
+    private static function client_location(): array {
+        $country = strtoupper(self::safe_server_value('HTTP_CF_IPCOUNTRY', 16));
+        $city = self::safe_server_value('HTTP_CF_IPCITY', 120);
+        $region = self::safe_server_value('HTTP_CF_REGION', 120);
+
+        return [
+            'city' => $city ?: null,
+            'region' => $region ?: null,
+            'country' => preg_match('/^[A-Z]{2}$/', $country) && $country !== 'XX' ? $country : null,
+        ];
+    }
+
+    private static function login_rate_key(): string {
+        $ip = self::client_ip();
+        return 'cortexwp_ai_login_rate_' . ($ip ? self::security_lookup_hash($ip) : 'unknown');
     }
 
     private static function latest_github_release(bool $force = false): ?array {
@@ -1458,6 +2310,16 @@ JS;
             case 'delete_snippet':
                 $result = self::delete_snippet((string) ($params['name'] ?? ''));
                 return is_wp_error($result) ? $result : rest_ensure_response($result);
+            case 'security_site_health':
+                return rest_ensure_response(self::site_health_scan((bool) ($params['refresh'] ?? false)));
+            case 'security_hardening_get':
+                return rest_ensure_response(self::public_hardening_state());
+            case 'security_hardening_update':
+                return rest_ensure_response(self::update_hardening_settings((array) ($params['settings'] ?? [])));
+            case 'security_login_events':
+                return rest_ensure_response(self::security_login_events((array) ($params['filters'] ?? $params)));
+            case 'security_login_events_clear':
+                return rest_ensure_response(self::clear_security_login_events());
         }
 
         return new WP_Error('cortexwp_ai_unknown_action', 'Unknown CortexWP action.', ['status' => 400]);
@@ -1985,6 +2847,9 @@ JS;
             'redirect_rule_count' => count(self::redirect_rules()),
             'php_environment' => true,
             'safe_file_patch' => true,
+            'security_site_health' => true,
+            'security_hardening' => true,
+            'security_login_monitor' => true,
             'component_backups' => true,
             'recovery_bridge' => self::recovery_bridge_status(),
             'wp_cli_available' => self::wp_cli_available(),
@@ -4901,4 +5766,5 @@ PHP;
     }
 }
 
+register_uninstall_hook(__FILE__, ['CortexWP_AI_Connector', 'uninstall']);
 CortexWP_AI_Connector::boot();
