@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.3
+ * Version: 1.4
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -2244,6 +2244,10 @@ JS;
         $action = sanitize_key($params['action'] ?? '');
 
         switch ($action) {
+            case 'management_snapshot':
+                return rest_ensure_response(self::management_snapshot());
+            case 'site_refresh_snapshot':
+                return rest_ensure_response(self::site_refresh_snapshot());
             case 'wp_cli':
                 return rest_ensure_response(self::run_wp_cli((array) ($params['args'] ?? []), (int) ($params['max_output_bytes'] ?? 500000)));
             case 'shell':
@@ -2319,6 +2323,8 @@ JS;
                 return is_wp_error($result) ? $result : rest_ensure_response($result);
             case 'security_site_health':
                 return rest_ensure_response(self::site_health_scan((bool) ($params['refresh'] ?? false)));
+            case 'security_snapshot':
+                return rest_ensure_response(self::security_snapshot((bool) ($params['refresh'] ?? false)));
             case 'security_hardening_get':
                 return rest_ensure_response(self::public_hardening_state());
             case 'security_hardening_update':
@@ -2847,6 +2853,8 @@ JS;
             'can_write_cortexwp_snippets' => self::ensure_snippet_dir(),
             'exec_available' => self::exec_available(),
             'native_management_available' => true,
+            'management_snapshot' => true,
+            'site_refresh_snapshot' => true,
             'fatal_error_monitor' => true,
             'fatal_error_endpoint' => self::fatal_error_endpoint(),
             'redirect_manager' => true,
@@ -2855,6 +2863,7 @@ JS;
             'php_environment' => true,
             'safe_file_patch' => true,
             'security_site_health' => true,
+            'security_snapshot' => true,
             'security_hardening' => true,
             'security_login_monitor' => true,
             'component_backups' => true,
@@ -5085,6 +5094,164 @@ PHP;
         }
 
         return $items;
+    }
+
+    private static function native_json_stdout(array $result): array {
+        $decoded = json_decode((string) ($result['stdout'] ?? '[]'), true);
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    private static function management_plugin_item(array $row): array {
+        $kind = (string) ($row['kind'] ?? 'plugin');
+        $status = (string) ($row['status'] ?? 'unknown');
+        $update_version = trim((string) ($row['update_version'] ?? ''));
+        $update = (string) ($row['update'] ?? 'none');
+        $is_must_use = $kind === 'mu-plugin' || $status === 'must-use';
+        $is_dropin = $kind === 'dropin' || $status === 'dropin';
+
+        return [
+            'name' => (string) ($row['name'] ?? ''),
+            'title' => (string) ($row['title'] ?? $row['name'] ?? ''),
+            'pluginFile' => (string) ($row['plugin_file'] ?? ''),
+            'kind' => in_array($kind, ['plugin', 'mu-plugin', 'dropin'], true) ? $kind : 'plugin',
+            'status' => $status,
+            'version' => (string) (($row['version'] ?? '') ?: 'unknown'),
+            'update' => $update,
+            'updateVersion' => $update_version !== '' ? $update_version : null,
+            'autoUpdate' => (string) ($row['auto_update'] ?? 'off'),
+            'needsUpdate' => strtolower($update) === 'available' || $update_version !== '',
+            'isActive' => $status === 'active' || $status === 'active-network' || $is_must_use,
+            'isMustUse' => $is_must_use,
+            'isDropIn' => $is_dropin,
+            'isActualPlugin' => !$is_must_use && !$is_dropin,
+        ];
+    }
+
+    private static function management_theme_item(array $row): array {
+        $update_version = trim((string) ($row['update_version'] ?? ''));
+        $update = (string) ($row['update'] ?? 'none');
+        $status = (string) ($row['status'] ?? 'unknown');
+
+        return [
+            'name' => (string) ($row['name'] ?? ''),
+            'title' => (string) ($row['title'] ?? $row['name'] ?? ''),
+            'status' => $status,
+            'version' => (string) (($row['version'] ?? '') ?: 'unknown'),
+            'update' => $update,
+            'updateVersion' => $update_version !== '' ? $update_version : null,
+            'autoUpdate' => (string) ($row['auto_update'] ?? 'off'),
+            'needsUpdate' => strtolower($update) === 'available' || $update_version !== '',
+            'isActive' => $status === 'active',
+        ];
+    }
+
+    private static function management_counts(array $plugins, array $themes, bool $core_has_update): array {
+        $plugin_active = 0;
+        $plugin_updates = 0;
+        $plugin_auto_updates = 0;
+        $theme_active = 0;
+        $theme_updates = 0;
+        $theme_auto_updates = 0;
+
+        foreach ($plugins as $plugin) {
+            if (!empty($plugin['isActive'])) {
+                $plugin_active++;
+            }
+            if (!empty($plugin['needsUpdate'])) {
+                $plugin_updates++;
+            }
+            if (($plugin['autoUpdate'] ?? '') === 'on') {
+                $plugin_auto_updates++;
+            }
+        }
+
+        foreach ($themes as $theme) {
+            if (!empty($theme['isActive'])) {
+                $theme_active++;
+            }
+            if (!empty($theme['needsUpdate'])) {
+                $theme_updates++;
+            }
+            if (($theme['autoUpdate'] ?? '') === 'on') {
+                $theme_auto_updates++;
+            }
+        }
+
+        return [
+            'pluginTotal' => count($plugins),
+            'pluginActive' => $plugin_active,
+            'pluginInactive' => max(0, count($plugins) - $plugin_active),
+            'pluginUpdates' => $plugin_updates,
+            'pluginAutoUpdates' => $plugin_auto_updates,
+            'themeTotal' => count($themes),
+            'themeActive' => $theme_active,
+            'themeUpdates' => $theme_updates,
+            'themeAutoUpdates' => $theme_auto_updates,
+            'totalUpdates' => $plugin_updates + $theme_updates + ($core_has_update ? 1 : 0),
+        ];
+    }
+
+    private static function management_snapshot(): array {
+        $core_updates = self::native_core_updates();
+        $core_update = $core_updates[0] ?? null;
+        $plugins = [];
+        $themes = [];
+
+        foreach (self::native_json_stdout(self::native_plugin_list(['plugin', 'list'], 500000)) as $row) {
+            if (is_array($row)) {
+                $item = self::management_plugin_item($row);
+                if ($item['name'] !== '') {
+                    $plugins[] = $item;
+                }
+            }
+        }
+
+        foreach (self::native_json_stdout(self::native_theme_list(['theme', 'list'], 500000)) as $row) {
+            if (is_array($row)) {
+                $item = self::management_theme_item($row);
+                if ($item['name'] !== '') {
+                    $themes[] = $item;
+                }
+            }
+        }
+
+        $core = [
+            'currentVersion' => get_bloginfo('version'),
+            'hasUpdate' => is_array($core_update),
+        ];
+
+        if (is_array($core_update)) {
+            $core['availableVersion'] = (string) ($core_update['version'] ?? '');
+            $core['updateType'] = (string) ($core_update['update_type'] ?? '');
+            $core['packageUrl'] = (string) ($core_update['package_url'] ?? '');
+            $core['locale'] = (string) ($core_update['locale'] ?? get_locale());
+            $core['response'] = (string) ($core_update['response'] ?? '');
+        }
+
+        return [
+            'fetchedAt' => gmdate('c'),
+            'connectionMethod' => 'plugin',
+            'core' => $core,
+            'plugins' => $plugins,
+            'themes' => $themes,
+            'counts' => self::management_counts($plugins, $themes, is_array($core_update)),
+        ];
+    }
+
+    private static function security_snapshot(bool $force): array {
+        return [
+            'health' => self::site_health_scan($force),
+            'hardening' => self::public_hardening_state(),
+            'refreshedAt' => gmdate('c'),
+        ];
+    }
+
+    private static function site_refresh_snapshot(): array {
+        return [
+            'management' => self::management_snapshot(),
+            'security' => self::security_snapshot(true),
+            'refreshedAt' => gmdate('c'),
+        ];
     }
 
     private static function upgrader_error_message($result, string $fallback): string {
