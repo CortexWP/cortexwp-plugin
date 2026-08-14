@@ -2397,6 +2397,7 @@ JS;
                 'type' => 'plugin',
                 'name' => (string) $plugin['name'],
                 'title' => (string) $plugin['title'],
+                'plugin_file' => $file,
                 'version' => (string) $plugin['version'],
                 'source_path' => $source,
                 'root_path' => WP_PLUGIN_DIR,
@@ -2732,6 +2733,7 @@ JS;
                 'archive_format' => 'zip',
                 'name' => (string) $component['name'],
                 'title' => (string) $component['title'],
+                'plugin_file' => (string) ($component['plugin_file'] ?? ''),
                 'type' => (string) $component['type'],
                 'version' => (string) $component['version'],
                 'source_path' => $source,
@@ -5050,6 +5052,7 @@ PHP;
         $auto_updates = get_site_option('auto_update_themes', []);
         $auto_updates = is_array($auto_updates) ? $auto_updates : [];
         $active = get_stylesheet();
+        $active_template = get_template();
         $items = [];
 
         foreach (wp_get_themes() as $slug => $theme) {
@@ -5057,7 +5060,10 @@ PHP;
             $items[] = [
                 'name' => (string) $slug,
                 'title' => (string) $theme->get('Name'),
+                'stylesheet' => (string) $theme->get_stylesheet(),
+                'template' => (string) $theme->get_template(),
                 'status' => (string) $slug === $active ? 'active' : 'inactive',
+                'is_active_parent' => (string) $slug === $active_template,
                 'version' => (string) $theme->get('Version') ?: 'unknown',
                 'update' => $update ? 'available' : 'none',
                 'update_version' => is_array($update) && isset($update['new_version']) ? (string) $update['new_version'] : '',
@@ -5135,6 +5141,8 @@ PHP;
         return [
             'name' => (string) ($row['name'] ?? ''),
             'title' => (string) ($row['title'] ?? $row['name'] ?? ''),
+            'stylesheet' => (string) ($row['stylesheet'] ?? $row['name'] ?? ''),
+            'template' => (string) ($row['template'] ?? ''),
             'status' => $status,
             'version' => (string) (($row['version'] ?? '') ?: 'unknown'),
             'update' => $update,
@@ -5142,6 +5150,7 @@ PHP;
             'autoUpdate' => (string) ($row['auto_update'] ?? 'off'),
             'needsUpdate' => strtolower($update) === 'available' || $update_version !== '',
             'isActive' => $status === 'active',
+            'isActiveParent' => !empty($row['is_active_parent']),
         ];
     }
 
@@ -5379,6 +5388,7 @@ PHP;
         foreach ($files as $file) {
             $rows[] = [
                 'name' => isset($before[$file]) ? $before[$file]['name'] : self::plugin_slug_from_file($file),
+                'plugin_file' => (string) $file,
                 'old_version' => isset($before[$file]) ? $before[$file]['version'] : '',
                 'new_version' => isset($after[$file]) ? $after[$file]['version'] : '',
                 'status' => 'Updated',
