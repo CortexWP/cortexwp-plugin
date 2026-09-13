@@ -3295,7 +3295,41 @@ JS;
             return '';
         }
 
+        $host = wp_parse_url($url, PHP_URL_HOST);
+        if (!is_string($host) || !self::is_valid_redirect_hostname($host)) {
+            return '';
+        }
+
         return $url;
+    }
+
+    private static function is_valid_redirect_hostname(string $host): bool {
+        $host = strtolower(trim($host));
+        if ($host === '' || substr($host, -1) === '.') {
+            return false;
+        }
+
+        if ($host === 'localhost' || filter_var($host, FILTER_VALIDATE_IP)) {
+            return true;
+        }
+
+        if (strpos($host, ':') !== false) {
+            return true;
+        }
+
+        $labels = explode('.', $host);
+        if (count($labels) < 2) {
+            return false;
+        }
+
+        foreach ($labels as $label) {
+            if (!preg_match('/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i', $label)) {
+                return false;
+            }
+        }
+
+        $tld = end($labels);
+        return is_string($tld) && (bool) preg_match('/^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i', $tld);
     }
 
     private static function clean_redirect_rules(array $rules): array {
