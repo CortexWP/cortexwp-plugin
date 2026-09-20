@@ -4905,13 +4905,37 @@ PHP;
         ];
     }
 
-    private static function upgrader_error_message($result, string $fallback): string {
+    private static function upgrader_error_message($result, string $fallback, string $target = ''): string {
         if (is_wp_error($result)) {
-            return $result->get_error_message();
+            $messages = $result->get_error_messages();
+            $message = implode('; ', array_values(array_unique(array_filter(array_map('strval', $messages)))));
+            $codes = array_values(array_unique(array_filter(array_map('strval', $result->get_error_codes()))));
+            if (!empty($codes)) {
+                $message = '[' . implode(', ', $codes) . '] ' . $message;
+            }
+            return $target !== ''
+                ? 'Update failed for ' . $target . ': ' . ($message !== '' ? $message : $fallback)
+                : ($message !== '' ? $message : $fallback);
+        }
+
+        if (is_array($result)) {
+            $errors = [];
+            foreach ($result as $key => $item) {
+                if (is_wp_error($item)) {
+                    $label = is_string($key) && $key !== '' ? $key : $target;
+                    $errors[] = self::upgrader_error_message($item, $fallback, $label);
+                } elseif ($item === false || $item === null) {
+                    $label = is_string($key) && $key !== '' ? $key : $target;
+                    $errors[] = ($label !== '' ? 'Update failed for ' . $label . ': ' : '') . $fallback;
+                }
+            }
+
+            $errors = array_values(array_unique(array_filter($errors)));
+            return implode('; ', $errors);
         }
 
         if ($result === false || $result === null) {
-            return $fallback;
+            return $target !== '' ? 'Update failed for ' . $target . ': ' . $fallback : $fallback;
         }
 
         return '';
