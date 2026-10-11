@@ -3211,6 +3211,15 @@ JS;
         $title = trim($title) ?: ucwords(str_replace(['-', '_'], ' ', $slug));
         $enabled = array_key_exists('enabled', $options) ? (bool) $options['enabled'] : true;
         $source = sanitize_key((string) ($options['source'] ?? 'ai')) ?: 'ai';
+
+        if ($source === 'ai' && !self::ai_snippet_code_is_safe($code)) {
+            return new WP_Error(
+                'cortexwp_ai_unsafe_snippet',
+                'This snippet contains unsupported file-management code.',
+                ['status' => 400]
+            );
+        }
+
         $php = self::normalize_snippet_php($code);
         $path = self::snippet_path($slug);
 
@@ -3231,6 +3240,21 @@ JS;
             'enabled' => $enabled,
             'path' => str_replace(trailingslashit(WP_CONTENT_DIR), 'wp-content/', $path),
         ];
+    }
+
+    private static function ai_snippet_code_is_safe(string $code): bool {
+        if (!preg_match('/^\s*<\?php\b/i', $code)) {
+            return false;
+        }
+
+        if (!preg_match('/defined\s*\(\s*[\'\"]ABSPATH[\'\"]\s*\).*?\bexit\s*;/is', $code)) {
+            return false;
+        }
+
+        return !preg_match(
+            '/\b(?:unlink|wp_delete_file|rmdir|rename|copy|file_put_contents|fopen|fwrite|chmod|chown|touch)\s*\(/i',
+            $code
+        );
     }
 
     private static function normalize_snippet_php(string $code): string {
