@@ -43,6 +43,8 @@ final class CortexWP_AI_Connector {
         self::$reserved_memory = str_repeat('x', 262144);
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
         add_action('admin_enqueue_scripts', [__CLASS__, 'admin_assets']);
+        add_action('load-toplevel_page_cortexwp-ai', [__CLASS__, 'suppress_admin_notices_on_cortexwp_pages'], 999);
+        add_action('load-cortexwp_page_cortexwp-ai-snippets', [__CLASS__, 'suppress_admin_notices_on_cortexwp_pages'], 999);
         add_filter('admin_body_class', [__CLASS__, 'admin_body_class']);
         add_action('admin_post_cortexwp_ai_save', [__CLASS__, 'save_settings']);
         add_action('admin_post_cortexwp_ai_save_snippet', [__CLASS__, 'save_snippet_from_admin']);
@@ -181,6 +183,12 @@ final class CortexWP_AI_Connector {
 
     public static function admin_body_class(string $classes): string {
         return self::autopilot_managed() ? trim($classes . ' cortexwp-updates-managed') : $classes;
+    }
+
+    public static function suppress_admin_notices_on_cortexwp_pages(): void {
+        remove_all_actions('admin_notices');
+        remove_all_actions('network_admin_notices');
+        remove_all_actions('all_admin_notices');
     }
 
     private static function should_check_recovery_bridge_on_boot(): bool {
@@ -1771,16 +1779,17 @@ body.toplevel_page_cortexwp-ai #wpbody-content,
 body.cortexwp_page_cortexwp-ai-snippets #wpbody-content {
     overflow: visible;
 }
-body.toplevel_page_cortexwp-ai #wpbody-content > .notice,
-body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .notice,
-body.toplevel_page_cortexwp-ai #wpbody-content > .updated,
-body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .updated,
-body.toplevel_page_cortexwp-ai #wpbody-content > .error,
-body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .error {
-    width: auto;
-    max-width: 1180px;
-    margin: 18px 20px 0;
-    box-sizing: border-box;
+body.toplevel_page_cortexwp-ai #wpbody-content .notice,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content .notice,
+body.toplevel_page_cortexwp-ai #wpbody-content .updated,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content .updated,
+body.toplevel_page_cortexwp-ai #wpbody-content .error,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content .error,
+body.toplevel_page_cortexwp-ai #wpbody-content .update-nag,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content .update-nag,
+body.toplevel_page_cortexwp-ai #wpbody-content #message,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content #message {
+    display: none !important;
 }
 body.toplevel_page_cortexwp-ai #wpbody-content > .wrap.cortexwp-shell,
 body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .wrap.cortexwp-shell {
@@ -2097,18 +2106,89 @@ body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .wrap.cortexwp-shell {
     }
 }
 .cortexwp-connection-page {
-    max-width: 880px;
+    max-width: 980px;
+    margin: 42px auto 0;
 }
-.cortexwp-connection-header {
-    margin-bottom: 18px;
+.cortexwp-connection-card {
+    overflow: hidden;
+    border: 1px solid #dfe4eb;
+    border-radius: 14px;
+    background: #fff;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, .06);
+}
+.cortexwp-connection-heading {
+    display: flex;
+    align-items: center;
+    min-height: 86px;
+    padding: 24px 32px;
+    border-bottom: 1px solid #edf0f4;
+}
+.cortexwp-connection-heading h1 {
+    margin: 0;
+    color: #172033;
+    font-size: 22px;
+    font-weight: 650;
+    letter-spacing: -.02em;
+    line-height: 1.2;
 }
 .cortexwp-connection-fields {
     display: grid;
-    gap: 22px;
+    gap: 24px;
+    padding: 30px 32px 34px;
 }
 .cortexwp-connection-field {
     display: grid;
-    gap: 8px;
+    gap: 9px;
+}
+.cortexwp-connection-field .cortexwp-label {
+    margin: 0;
+    color: #273247;
+    font-size: 13px;
+    font-weight: 650;
+    letter-spacing: 0;
+    text-transform: none;
+}
+.cortexwp-connection-field .cortexwp-input,
+.cortexwp-connection-field .cortexwp-key-input {
+    min-height: 48px;
+    padding: 0 14px;
+    border-color: #cfd6e1 !important;
+    border-radius: 8px;
+    background: #fbfcfe !important;
+    font-size: 14px;
+    transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
+}
+.cortexwp-connection-field .cortexwp-input:focus,
+.cortexwp-connection-field .cortexwp-key-input:focus {
+    border-color: #3478f6 !important;
+    background: #fff !important;
+    box-shadow: 0 0 0 3px rgba(52, 120, 246, .14) !important;
+    outline: none;
+}
+.cortexwp-connection-field .cortexwp-key-input {
+    color: #344054 !important;
+    font-size: 13px;
+    letter-spacing: .01em;
+}
+.cortexwp-connection-page .cortexwp-key-row {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 9px;
+}
+.cortexwp-connection-page .cortexwp-button {
+    min-height: 48px;
+    padding: 0 16px !important;
+    border-color: #cfd6e1 !important;
+    border-radius: 8px !important;
+    font-size: 13px;
+    white-space: nowrap;
+}
+.cortexwp-connection-page .cortexwp-button-primary {
+    border-color: #2563eb !important;
+    background: #2563eb !important;
+}
+.cortexwp-connection-page .cortexwp-button-primary:hover {
+    border-color: #1d4ed8 !important;
+    background: #1d4ed8 !important;
 }
 .cortexwp-inline-notice {
     margin: 18px 0 0;
@@ -2220,6 +2300,20 @@ body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .wrap.cortexwp-shell {
     color: #fff;
 }
 @media (max-width: 520px) {
+    .cortexwp-connection-page {
+        margin: 24px 12px 0;
+    }
+    .cortexwp-connection-heading,
+    .cortexwp-connection-fields {
+        padding-left: 20px;
+        padding-right: 20px;
+    }
+    .cortexwp-connection-page .cortexwp-key-row {
+        grid-template-columns: 1fr 1fr;
+    }
+    .cortexwp-connection-page .cortexwp-key-input {
+        grid-column: 1 / -1;
+    }
     .cortexwp-update-modal { padding: 14px; }
     .cortexwp-update-dialog-head,
     .cortexwp-update-benefits,
@@ -2478,31 +2572,29 @@ JS;
 
         $key = self::connector_key();
         ?>
-        <div class="wrap cortexwp-admin cortexwp-shell cortexwp-connection-page">
-            <div class="cortexwp-hero cortexwp-connection-header">
-                <div>
-                    <p class="cortexwp-eyebrow">CortexWP connector</p>
-                    <h1>Connect this site</h1>
-                </div>
-            </div>
+        <div class="wrap cortexwp-admin cortexwp-connection-page">
+            <section class="cortexwp-connection-card" aria-label="CortexWP connection">
+                <header class="cortexwp-connection-heading">
+                    <h1>CortexWP Connector</h1>
+                </header>
+                <div class="cortexwp-connection-fields">
+                    <label class="cortexwp-connection-field">
+                        <span class="cortexwp-label">WordPress URL</span>
+                        <input type="text" readonly class="cortexwp-input" value="<?php echo esc_attr(home_url('/')); ?>" onclick="this.select();" aria-label="WordPress URL" />
+                    </label>
 
-            <section class="cortexwp-panel cortexwp-connection-fields" aria-label="CortexWP connection details">
-                <label class="cortexwp-connection-field">
-                    <span class="cortexwp-label">WordPress URL</span>
-                    <input type="text" readonly class="cortexwp-input" value="<?php echo esc_attr(home_url('/')); ?>" onclick="this.select();" aria-label="WordPress URL" />
-                </label>
-
-                <div class="cortexwp-connection-field">
-                    <label class="cortexwp-label" for="cortexwp-api-key">API key</label>
-                    <div class="cortexwp-key-row">
-                        <input id="cortexwp-api-key" type="text" readonly class="cortexwp-key-input code" value="<?php echo esc_attr($key); ?>" onclick="this.select();" aria-label="CortexWP API key" />
-                        <button type="button" id="cortexwp-copy-key" class="button cortexwp-button">Copy key</button>
-                        <button type="button" id="cortexwp-regenerate-key" class="button cortexwp-button cortexwp-button-primary">Regenerate key</button>
+                    <div class="cortexwp-connection-field">
+                        <label class="cortexwp-label" for="cortexwp-api-key">API key</label>
+                        <div class="cortexwp-key-row">
+                            <input id="cortexwp-api-key" type="text" readonly class="cortexwp-key-input code" value="<?php echo esc_attr($key); ?>" onclick="this.select();" aria-label="CortexWP API key" />
+                            <button type="button" id="cortexwp-copy-key" class="button cortexwp-button">Copy key</button>
+                            <button type="button" id="cortexwp-regenerate-key" class="button cortexwp-button cortexwp-button-primary">Regenerate key</button>
+                        </div>
                     </div>
-                </div>
 
-                <input type="hidden" id="cortexwp-regenerate-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_regenerate_key')); ?>" />
-                <div id="cortexwp-key-status" class="cortexwp-status" role="status" aria-live="polite"></div>
+                    <input type="hidden" id="cortexwp-regenerate-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_regenerate_key')); ?>" />
+                    <div id="cortexwp-key-status" class="cortexwp-status" role="status" aria-live="polite"></div>
+                </div>
             </section>
         </div>
         <?php
