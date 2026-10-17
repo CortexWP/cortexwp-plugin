@@ -12,6 +12,7 @@ $wpdb->query('DROP TABLE IF EXISTS ' . esc_sql($table));
 $option_names = [
     'cortexwp_ai_connector_key',
     'cortexwp_ai_connector_key_domain',
+    'cortexwp_ai_connector_key_viewed',
     'cortexwp_ai_connector_settings',
     'cortexwp_ai_autopilot_managed',
     'cortexwp_ai_security_hardening',

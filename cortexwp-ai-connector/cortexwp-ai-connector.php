@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.6
+ * Version: 1.7
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -18,6 +18,7 @@ if (!defined('ABSPATH')) {
 final class CortexWP_AI_Connector {
     private const OPTION_KEY = 'cortexwp_ai_connector_key';
     private const OPTION_KEY_DOMAIN = 'cortexwp_ai_connector_key_domain';
+    private const OPTION_KEY_VIEWED = 'cortexwp_ai_connector_key_viewed';
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
     private const OPTION_AUTOPILOT_MANAGED = 'cortexwp_ai_autopilot_managed';
     private const OPTION_SECURITY_HARDENING = 'cortexwp_ai_security_hardening';
@@ -51,8 +52,10 @@ final class CortexWP_AI_Connector {
         add_action('admin_post_cortexwp_ai_delete_snippet', [__CLASS__, 'delete_snippet_from_admin']);
         add_action('admin_post_cortexwp_ai_toggle_snippet', [__CLASS__, 'toggle_snippet_from_admin']);
         add_action('wp_ajax_cortexwp_ai_regenerate_key', [__CLASS__, 'ajax_regenerate_key']);
+        add_action('wp_ajax_cortexwp_ai_reveal_key', [__CLASS__, 'ajax_reveal_key']);
         add_action('plugins_loaded', [__CLASS__, 'load_snippets'], 20);
         add_action('init', [__CLASS__, 'maybe_upgrade_security_storage'], 1);
+        add_action('init', [__CLASS__, 'maybe_upgrade_key_visibility'], 1);
         add_action('init', [__CLASS__, 'maybe_whitelist_service_ip'], 20);
         add_action('admin_notices', [__CLASS__, 'admin_update_policy_notice']);
         add_action('send_headers', [__CLASS__, 'send_security_headers'], 1);
@@ -103,6 +106,7 @@ final class CortexWP_AI_Connector {
         self::ensure_login_events_table();
         self::ensure_recovery_bridge(true);
         add_option(self::OPTION_AUTOPILOT_MANAGED, false, '', false);
+        add_option(self::OPTION_KEY_VIEWED, false, '', false);
     }
 
     private static function maybe_ensure_recovery_bridge(): void {
@@ -341,6 +345,21 @@ final class CortexWP_AI_Connector {
     public static function maybe_upgrade_security_storage(): void {
         if (get_option(self::OPTION_LOGIN_TABLE_VERSION) !== self::LOGIN_TABLE_VERSION) {
             self::ensure_login_events_table();
+        }
+    }
+
+    public static function maybe_upgrade_key_visibility(): void {
+        if (get_option(self::OPTION_KEY_VIEWED, null) !== null) {
+            return;
+        }
+
+        // Before one-time reveal was introduced, the full key was rendered on
+        // every connection-page load. Treat existing keys as already viewed;
+        // only a regenerated key gets a fresh reveal window.
+        if (get_option(self::OPTION_KEY, '')) {
+            update_option(self::OPTION_KEY_VIEWED, true, false);
+        } else {
+            add_option(self::OPTION_KEY_VIEWED, false, '', false);
         }
     }
 
@@ -2170,8 +2189,14 @@ body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .wrap.cortexwp-shell {
     font-size: 13px;
     letter-spacing: .01em;
 }
+.cortexwp-connection-help {
+    margin: 0;
+    color: #667085;
+    font-size: 12px;
+    line-height: 1.6;
+}
 .cortexwp-connection-page .cortexwp-key-row {
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-columns: minmax(0, 1fr) auto auto auto;
     gap: 9px;
 }
 .cortexwp-connection-page .cortexwp-button {
@@ -2189,6 +2214,13 @@ body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .wrap.cortexwp-shell {
 .cortexwp-connection-page .cortexwp-button-primary:hover {
     border-color: #1d4ed8 !important;
     background: #1d4ed8 !important;
+}
+.cortexwp-connection-page .cortexwp-button:disabled {
+    border-color: #d9dee7 !important;
+    background: #f4f6f8 !important;
+    color: #8a94a3 !important;
+    cursor: default;
+    opacity: 1;
 }
 .cortexwp-inline-notice {
     margin: 18px 0 0;
@@ -2350,11 +2382,59 @@ CSS;
     }
 
     $(document).on('click', '#cortexwp-copy-key', function () {
-        var value = $('#cortexwp-api-key').val();
+        var $input = $('#cortexwp-api-key');
+        if ($input.attr('data-revealed') !== '1') {
+            setStatus('View the key once before copying it.', 'error');
+            return;
+        }
+
+        var value = $input.val();
         $.when(copyValue(value)).done(function () {
             setStatus('API key copied to clipboard.', 'success');
         }).fail(function () {
             setStatus('Copy failed. Select the key and copy it manually.', 'error');
+        });
+    });
+
+    function markKeyRevealed(key) {
+        var $input = $('#cortexwp-api-key');
+        $input.val(key).attr('data-revealed', '1');
+        $('#cortexwp-view-key').prop('disabled', true).text('Viewed once');
+        $('#cortexwp-copy-key').prop('disabled', false);
+    }
+
+    $(document).on('click', '#cortexwp-view-key', function () {
+        var $button = $(this);
+
+        if (!window.confirm('The complete API key will be shown once. After this, you must regenerate the key to view another one. Continue?')) {
+            return;
+        }
+
+        $button.prop('disabled', true).text('Revealing...');
+        setStatus('Revealing the API key once...', '');
+
+        $.post(ajaxurl, {
+            action: 'cortexwp_ai_reveal_key',
+            nonce: $('#cortexwp-reveal-nonce').val()
+        }).done(function (response) {
+            if (!response || !response.success || !response.data || !response.data.key) {
+                setStatus(response && response.data && response.data.message ? response.data.message : 'Unable to reveal the API key.', 'error');
+                $button.prop('disabled', false).text('View key once');
+                return;
+            }
+
+            markKeyRevealed(response.data.key);
+            setStatus('API key revealed. Copy it now; it will be masked again when you leave this page.', 'success');
+        }).fail(function (xhr) {
+            var message = xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message
+                ? xhr.responseJSON.data.message
+                : 'Unable to reveal the API key. Please try again.';
+            setStatus(message, 'error');
+            if (xhr.status !== 409) {
+                $button.prop('disabled', false).text('View key once');
+            } else {
+                $button.prop('disabled', true).text('Viewed once');
+            }
         });
     });
 
@@ -2378,7 +2458,7 @@ CSS;
                 return;
             }
 
-            $('#cortexwp-api-key').val(response.data.key);
+            markKeyRevealed(response.data.key);
             $('#cortexwp-key-domain').text(response.data.domain);
             $('#cortexwp-current-domain').text(response.data.current_domain);
             setStatus('New API key generated. Copy it into CortexWP to reconnect this site.', 'success');
@@ -2571,6 +2651,7 @@ JS;
         }
 
         $key = self::connector_key();
+        $key_viewed = self::key_has_been_viewed();
         ?>
         <div class="wrap cortexwp-admin cortexwp-connection-page">
             <section class="cortexwp-connection-card" aria-label="CortexWP connection">
@@ -2586,12 +2667,15 @@ JS;
                     <div class="cortexwp-connection-field">
                         <label class="cortexwp-label" for="cortexwp-api-key">API key</label>
                         <div class="cortexwp-key-row">
-                            <input id="cortexwp-api-key" type="text" readonly class="cortexwp-key-input code" value="<?php echo esc_attr($key); ?>" onclick="this.select();" aria-label="CortexWP API key" />
-                            <button type="button" id="cortexwp-copy-key" class="button cortexwp-button">Copy key</button>
+                            <input id="cortexwp-api-key" type="text" readonly class="cortexwp-key-input code" value="<?php echo esc_attr(self::connector_key_prefix($key)); ?>" data-revealed="0" onclick="this.select();" aria-label="CortexWP API key, masked" />
+                            <button type="button" id="cortexwp-view-key" class="button cortexwp-button" <?php disabled($key_viewed, true); ?>><?php echo $key_viewed ? 'Viewed once' : 'View key once'; ?></button>
+                            <button type="button" id="cortexwp-copy-key" class="button cortexwp-button" disabled>Copy key</button>
                             <button type="button" id="cortexwp-regenerate-key" class="button cortexwp-button cortexwp-button-primary">Regenerate key</button>
                         </div>
+                        <p class="cortexwp-connection-help">Only the beginning of the key is shown here. The complete key is encrypted at rest and revealed once; regenerate it if you need to see a new key.</p>
                     </div>
 
+                    <input type="hidden" id="cortexwp-reveal-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_reveal_key')); ?>" />
                     <input type="hidden" id="cortexwp-regenerate-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_regenerate_key')); ?>" />
                     <div id="cortexwp-key-status" class="cortexwp-status" role="status" aria-live="polite"></div>
                 </div>
@@ -2738,6 +2822,7 @@ JS;
         if (!empty($_POST['regenerate_key'])) {
             $had_recovery_bridge = self::has_any_recovery_bridge();
             self::store_key(self::new_key());
+            update_option(self::OPTION_KEY_VIEWED, false, false);
             update_option(self::OPTION_KEY_DOMAIN, self::current_domain(), false);
             if ($had_recovery_bridge) {
                 self::ensure_recovery_bridge(true);
@@ -2752,6 +2837,39 @@ JS;
         exit;
     }
 
+    public static function ajax_reveal_key(): void {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => 'You do not have permission to manage CortexWP.'], 403);
+        }
+
+        check_ajax_referer('cortexwp_ai_reveal_key', 'nonce');
+
+        if (self::key_has_been_viewed()) {
+            wp_send_json_error([
+                'message' => 'This API key has already been revealed. Regenerate the key to view a new one.',
+            ], 409);
+        }
+
+        $key = self::connector_key();
+        if ($key === '') {
+            wp_send_json_error(['message' => 'The connector key is unavailable. Regenerate it and try again.'], 500);
+        }
+
+        // Mark the credential as viewed before returning it. A page refresh can
+        // never expose the same secret again through the WordPress UI.
+        if (!self::mark_key_viewed_once()) {
+            wp_send_json_error([
+                'message' => 'This API key has already been revealed. Regenerate the key to view a new one.',
+            ], 409);
+        }
+        nocache_headers();
+
+        wp_send_json_success([
+            'key' => $key,
+            'prefix' => self::connector_key_prefix($key),
+        ]);
+    }
+
     public static function ajax_regenerate_key(): void {
         if (!current_user_can('manage_options')) {
             wp_send_json_error(['message' => 'You do not have permission to manage CortexWP.'], 403);
@@ -2764,6 +2882,9 @@ JS;
         $had_recovery_bridge = self::has_any_recovery_bridge();
 
         self::store_key($key);
+        // The regenerated key is returned once in this response so the admin
+        // can copy it into CortexWP. It is masked again on the next page load.
+        update_option(self::OPTION_KEY_VIEWED, true, false);
         update_option(self::OPTION_KEY_DOMAIN, $domain, false);
         update_option(self::OPTION_SETTINGS, array_merge(self::connector_settings(), [
             'connection_method' => 'plugin',
@@ -2772,6 +2893,7 @@ JS;
             self::ensure_recovery_bridge(true);
         }
 
+        nocache_headers();
         wp_send_json_success([
             'key' => $key,
             'domain' => $domain,
@@ -5082,6 +5204,33 @@ PHP;
 
         self::store_key($stored);
         return $stored;
+    }
+
+    private static function key_has_been_viewed(): bool {
+        return (bool) get_option(self::OPTION_KEY_VIEWED, false);
+    }
+
+    private static function mark_key_viewed_once(): bool {
+        global $wpdb;
+
+        add_option(self::OPTION_KEY_VIEWED, false, '', false);
+
+        $updated = $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+            '1',
+            self::OPTION_KEY_VIEWED,
+            '0'
+        ));
+
+        return $updated === 1;
+    }
+
+    private static function connector_key_prefix(string $key): string {
+        if ($key === '') {
+            return 'Unavailable';
+        }
+
+        return self::truncate_text($key, 12) . '••••••••••••••••••••';
     }
 
     private static function store_key(string $key): void {
