@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.5
+ * Version: 1.6
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -19,6 +19,7 @@ final class CortexWP_AI_Connector {
     private const OPTION_KEY = 'cortexwp_ai_connector_key';
     private const OPTION_KEY_DOMAIN = 'cortexwp_ai_connector_key_domain';
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
+    private const OPTION_AUTOPILOT_MANAGED = 'cortexwp_ai_autopilot_managed';
     private const OPTION_SECURITY_HARDENING = 'cortexwp_ai_security_hardening';
     private const OPTION_LOGIN_TABLE_VERSION = 'cortexwp_ai_login_table_version';
     private const OPTION_REDIRECT_RULES = 'cortexwp_ai_redirect_rules';
@@ -32,6 +33,7 @@ final class CortexWP_AI_Connector {
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
     private const DEFAULT_APP_URL = 'http://127.0.0.1:3000';
+    private const CORTEXWP_SERVICE_IP = '40.233.109.6';
     private const FATAL_ERROR_ENDPOINT_PATH = '/api/wordpress/fatal-error';
     private static $reserved_memory = '';
     private static $login_rate_limited = false;
@@ -41,6 +43,7 @@ final class CortexWP_AI_Connector {
         self::$reserved_memory = str_repeat('x', 262144);
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
         add_action('admin_enqueue_scripts', [__CLASS__, 'admin_assets']);
+        add_filter('admin_body_class', [__CLASS__, 'admin_body_class']);
         add_action('admin_post_cortexwp_ai_save', [__CLASS__, 'save_settings']);
         add_action('admin_post_cortexwp_ai_save_snippet', [__CLASS__, 'save_snippet_from_admin']);
         add_action('admin_post_cortexwp_ai_delete_snippet', [__CLASS__, 'delete_snippet_from_admin']);
@@ -48,6 +51,8 @@ final class CortexWP_AI_Connector {
         add_action('wp_ajax_cortexwp_ai_regenerate_key', [__CLASS__, 'ajax_regenerate_key']);
         add_action('plugins_loaded', [__CLASS__, 'load_snippets'], 20);
         add_action('init', [__CLASS__, 'maybe_upgrade_security_storage'], 1);
+        add_action('init', [__CLASS__, 'maybe_whitelist_service_ip'], 20);
+        add_action('admin_notices', [__CLASS__, 'admin_update_policy_notice']);
         add_action('send_headers', [__CLASS__, 'send_security_headers'], 1);
         add_action('template_redirect', [__CLASS__, 'maybe_redirect_request'], 0);
         add_action('template_redirect', [__CLASS__, 'maybe_block_author_enumeration'], 1);
@@ -63,6 +68,13 @@ final class CortexWP_AI_Connector {
         add_filter('xmlrpc_enabled', [__CLASS__, 'xmlrpc_enabled']);
         add_filter('wp_is_application_passwords_available', [__CLASS__, 'application_passwords_available']);
         add_filter('map_meta_cap', [__CLASS__, 'block_file_editor_caps'], 10, 4);
+        add_filter('auto_update_plugin', [__CLASS__, 'disable_managed_plugin_auto_update'], 999, 2);
+        add_filter('auto_update_theme', [__CLASS__, 'disable_managed_theme_auto_update'], 999, 2);
+        add_filter('allow_major_auto_core_updates', [__CLASS__, 'disable_managed_major_core_updates'], 999);
+        add_filter('allow_minor_auto_core_updates', [__CLASS__, 'allow_managed_minor_core_updates'], 999);
+        add_filter('plugin_auto_update_setting_html', [__CLASS__, 'managed_plugin_auto_update_setting_html'], 999, 3);
+        add_filter('theme_auto_update_setting_html', [__CLASS__, 'managed_theme_auto_update_setting_html'], 999, 3);
+        add_filter('theme_auto_update_setting_template', [__CLASS__, 'managed_theme_auto_update_setting_template'], 999);
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_for_plugin_update']);
         add_filter('plugins_api', [__CLASS__, 'plugin_update_details'], 10, 3);
         register_shutdown_function([__CLASS__, 'capture_fatal_error']);
@@ -88,21 +100,87 @@ final class CortexWP_AI_Connector {
         self::ensure_snippet_dir();
         self::ensure_login_events_table();
         self::ensure_recovery_bridge(true);
-    }
-
-    public static function uninstall(): void {
-        global $wpdb;
-
-        $wpdb->query('DROP TABLE IF EXISTS ' . self::login_events_table());
-        delete_option(self::OPTION_LOGIN_TABLE_VERSION);
-        delete_option(self::OPTION_SECURITY_HARDENING);
-        delete_transient(self::SITE_HEALTH_CACHE_KEY);
+        add_option(self::OPTION_AUTOPILOT_MANAGED, false, '', false);
     }
 
     private static function maybe_ensure_recovery_bridge(): void {
         if (self::should_check_recovery_bridge_on_boot()) {
             self::ensure_recovery_bridge(false);
         }
+    }
+
+    public static function maybe_whitelist_service_ip(): void {
+        if (!class_exists('wordfence')) {
+            return;
+        }
+
+        try {
+            wordfence::whitelistIP(self::CORTEXWP_SERVICE_IP);
+        } catch (Throwable $error) {
+            error_log('CortexWP could not whitelist its service IP in Wordfence: ' . $error->getMessage());
+        }
+    }
+
+    private static function autopilot_managed(): bool {
+        return (bool) get_option(self::OPTION_AUTOPILOT_MANAGED, false);
+    }
+
+    public static function disable_managed_plugin_auto_update($update, $item) {
+        return self::autopilot_managed() ? false : $update;
+    }
+
+    public static function disable_managed_theme_auto_update($update, $item) {
+        return self::autopilot_managed() ? false : $update;
+    }
+
+    public static function disable_managed_major_core_updates($allow) {
+        return self::autopilot_managed() ? false : $allow;
+    }
+
+    public static function allow_managed_minor_core_updates($allow) {
+        // WordPress groups security releases with minor core updates. Keep those available.
+        return self::autopilot_managed() ? true : $allow;
+    }
+
+    public static function managed_plugin_auto_update_setting_html($html, $plugin_file, $plugin_data) {
+        if (!self::autopilot_managed()) {
+            return $html;
+        }
+
+        return '<span class="cortexwp-managed-auto-update">Auto-updates disabled — managed by CortexWP</span>';
+    }
+
+    public static function managed_theme_auto_update_setting_html($html, $stylesheet, $theme) {
+        if (!self::autopilot_managed()) {
+            return $html;
+        }
+
+        return '<span class="cortexwp-managed-auto-update">Auto-updates disabled — managed by CortexWP</span>';
+    }
+
+    public static function managed_theme_auto_update_setting_template($template) {
+        if (!self::autopilot_managed()) {
+            return $template;
+        }
+
+        return '<div class="theme-autoupdate"><span class="cortexwp-managed-auto-update">Auto-updates disabled — managed by CortexWP</span></div>';
+    }
+
+    public static function admin_update_policy_notice(): void {
+        if (!self::autopilot_managed() || !function_exists('get_current_screen')) {
+            return;
+        }
+
+        $screen = get_current_screen();
+        if (!$screen || !in_array((string) $screen->id, ['plugins', 'plugins-network', 'themes', 'themes-network', 'update-core'], true)) {
+            return;
+        }
+
+        echo '<div class="notice notice-info is-dismissible cortexwp-update-policy-notice"><p><strong>CortexWP manages updates for this site.</strong> Automatic plugin and theme updates are disabled here. WordPress security and minor core updates remain eligible, and all other updates should be run from CortexWP for backups, visual checks, rollback, and history.</p></div>';
+    }
+
+    public static function admin_body_class(string $classes): string {
+        return self::autopilot_managed() ? trim($classes . ' cortexwp-updates-managed') : $classes;
     }
 
     private static function should_check_recovery_bridge_on_boot(): bool {
@@ -1646,7 +1724,10 @@ final class CortexWP_AI_Connector {
     }
 
     public static function admin_assets(string $hook): void {
-        if (!in_array($hook, ['toplevel_page_cortexwp-ai', 'cortexwp_page_cortexwp-ai-snippets'], true)) {
+        $is_connector_page = in_array($hook, ['toplevel_page_cortexwp-ai', 'cortexwp_page_cortexwp-ai-snippets'], true);
+        $is_update_screen = in_array($hook, ['plugins.php', 'themes.php', 'update-core.php'], true);
+
+        if (!$is_connector_page && !$is_update_screen) {
             return;
         }
 
@@ -1657,7 +1738,7 @@ final class CortexWP_AI_Connector {
         wp_enqueue_script('jquery');
         wp_add_inline_script('jquery', self::admin_js());
 
-        if ($hook === 'cortexwp_page_cortexwp-ai-snippets') {
+        if ($is_connector_page && $hook === 'cortexwp_page_cortexwp-ai-snippets') {
             wp_enqueue_code_editor(['type' => 'application/x-httpd-php']);
             wp_enqueue_script('code-editor');
             wp_enqueue_style('code-editor');
@@ -1682,8 +1763,35 @@ final class CortexWP_AI_Connector {
     box-sizing: border-box;
 }
 .cortexwp-shell {
+    width: auto;
     max-width: 1180px;
-    margin-top: 24px;
+    margin: 24px 20px 0;
+}
+body.toplevel_page_cortexwp-ai #wpbody-content,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content {
+    overflow: visible;
+}
+body.toplevel_page_cortexwp-ai #wpbody-content > .notice,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .notice,
+body.toplevel_page_cortexwp-ai #wpbody-content > .updated,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .updated,
+body.toplevel_page_cortexwp-ai #wpbody-content > .error,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .error {
+    width: auto;
+    max-width: 1180px;
+    margin: 18px 20px 0;
+    box-sizing: border-box;
+}
+body.toplevel_page_cortexwp-ai #wpbody-content > .wrap.cortexwp-shell,
+body.cortexwp_page_cortexwp-ai-snippets #wpbody-content > .wrap.cortexwp-shell {
+    clear: both;
+}
+.cortexwp-managed-auto-update {
+    display: inline-block;
+    color: #1d4ed8;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.45;
 }
 .cortexwp-hero,
 .cortexwp-panel,
@@ -1988,6 +2096,137 @@ final class CortexWP_AI_Connector {
         margin-top: 14px;
     }
 }
+.cortexwp-connection-page {
+    max-width: 880px;
+}
+.cortexwp-connection-header {
+    margin-bottom: 18px;
+}
+.cortexwp-connection-fields {
+    display: grid;
+    gap: 22px;
+}
+.cortexwp-connection-field {
+    display: grid;
+    gap: 8px;
+}
+.cortexwp-inline-notice {
+    margin: 18px 0 0;
+    padding: 12px 14px;
+    border: 1px solid #b7d8c2;
+    background: #edf8f0;
+    color: #155c35;
+    font-weight: 700;
+}
+.cortexwp-update-modal {
+    position: fixed;
+    z-index: 100000;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(15, 23, 42, .58);
+}
+.cortexwp-update-dialog {
+    width: min(100%, 570px);
+    overflow: hidden;
+    border: 1px solid #d8dee8;
+    border-radius: 16px;
+    background: #fff;
+    box-shadow: 0 28px 80px rgba(15, 23, 42, .28);
+    color: #111827;
+}
+.cortexwp-update-dialog-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 28px 28px 20px;
+    background: linear-gradient(135deg, #eff6ff, #ffffff 60%);
+}
+.cortexwp-update-dialog-kicker {
+    margin: 0 0 8px;
+    color: #2563eb;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+}
+.cortexwp-update-dialog h2 {
+    margin: 0;
+    font-size: 25px;
+    line-height: 1.15;
+}
+.cortexwp-update-dialog-copy {
+    margin: 10px 0 0;
+    color: #5b6472;
+    font-size: 14px;
+    line-height: 1.65;
+}
+.cortexwp-update-dialog-close {
+    border: 0;
+    background: transparent;
+    color: #5b6472;
+    cursor: pointer;
+    font-size: 25px;
+    line-height: 1;
+}
+.cortexwp-update-benefits {
+    display: grid;
+    gap: 12px;
+    margin: 0;
+    padding: 22px 28px 8px;
+    list-style: none;
+}
+.cortexwp-update-benefits li {
+    display: flex;
+    gap: 11px;
+    align-items: flex-start;
+    color: #263241;
+    font-size: 14px;
+    line-height: 1.5;
+}
+.cortexwp-update-benefits li::before {
+    content: '✓';
+    display: inline-grid;
+    flex: 0 0 22px;
+    height: 22px;
+    place-items: center;
+    border-radius: 50%;
+    background: #e8f7ee;
+    color: #047857;
+    font-weight: 900;
+}
+.cortexwp-update-dialog-foot {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 22px 28px 28px;
+}
+.cortexwp-update-dialog-foot button {
+    min-height: 40px;
+    padding: 0 15px;
+    border: 1px solid #d8dee8;
+    border-radius: 8px;
+    background: #fff;
+    color: #111827;
+    cursor: pointer;
+    font-weight: 700;
+}
+.cortexwp-update-dialog-foot .cortexwp-update-cancel {
+    border-color: #2563eb;
+    background: #2563eb;
+    color: #fff;
+}
+@media (max-width: 520px) {
+    .cortexwp-update-modal { padding: 14px; }
+    .cortexwp-update-dialog-head,
+    .cortexwp-update-benefits,
+    .cortexwp-update-dialog-foot { padding-left: 20px; padding-right: 20px; }
+    .cortexwp-update-dialog-foot { display: grid; }
+    .cortexwp-update-dialog-foot button { width: 100%; }
+}
 CSS;
     }
 
@@ -2055,6 +2294,179 @@ CSS;
             $button.prop('disabled', false).text('Regenerate key');
         });
     });
+
+    function cortexwpManagedUpdates() {
+        return document.body && document.body.classList.contains('cortexwp-updates-managed');
+    }
+
+    var cortexwpNativeUpdateCall = false;
+
+    function cortexwpIsUpdateAction(action) {
+        return action === 'update-plugin' || action === 'update-theme' || action === 'update-core' || action === 'do-core-upgrade';
+    }
+
+    function cortexwpBlockedUpdatePromise() {
+        return $.Deferred().reject({ cortexwpBlocked: true }).promise();
+    }
+
+    function cortexwpInstallWordPressUpdateGuards() {
+        if (!cortexwpManagedUpdates() || !window.wp || !wp.updates) {
+            return false;
+        }
+
+        var updates = wp.updates;
+
+        ['updatePlugin', 'updateTheme'].forEach(function (method) {
+            if (typeof updates[method] !== 'function' || updates[method].cortexwpGuarded) {
+                return;
+            }
+
+            var original = updates[method];
+            var guarded = function () {
+                var context = this;
+                var args = arguments;
+
+                cortexwpOpenUpdateModal(function () {
+                    cortexwpNativeUpdateCall = true;
+                    try {
+                        original.apply(context, args);
+                    } finally {
+                        cortexwpNativeUpdateCall = false;
+                    }
+                });
+
+                return cortexwpBlockedUpdatePromise();
+            };
+
+            guarded.cortexwpGuarded = true;
+            updates[method] = guarded;
+        });
+
+        if (typeof updates.ajax === 'function' && !updates.ajax.cortexwpGuarded) {
+            var originalAjax = updates.ajax;
+            var guardedAjax = function (action, data) {
+                if (!cortexwpNativeUpdateCall && cortexwpIsUpdateAction(action)) {
+                    var context = this;
+                    var args = arguments;
+
+                    cortexwpOpenUpdateModal(function () {
+                        cortexwpNativeUpdateCall = true;
+                        try {
+                            originalAjax.apply(context, args);
+                        } finally {
+                            cortexwpNativeUpdateCall = false;
+                        }
+                    });
+
+                    return cortexwpBlockedUpdatePromise();
+                }
+
+                return originalAjax.apply(this, arguments);
+            };
+
+            guardedAjax.cortexwpGuarded = true;
+            updates.ajax = guardedAjax;
+        }
+
+        return typeof updates.updatePlugin === 'function' || typeof updates.updateTheme === 'function';
+    }
+
+    function cortexwpWatchForWordPressUpdateGuards(attempts) {
+        if (cortexwpInstallWordPressUpdateGuards() || attempts >= 100) {
+            return;
+        }
+
+        window.setTimeout(function () {
+            cortexwpWatchForWordPressUpdateGuards(attempts + 1);
+        }, 50);
+    }
+
+    function cortexwpUpdateAnchor(element) {
+        var href = String(element.getAttribute('href') || '').toLowerCase();
+        return href.indexOf('update-core.php') !== -1 ||
+            /update\.php[^#]*(?:upgrade-plugin|upgrade-theme|update-selected|do-core-upgrade)/.test(href) ||
+            (element.className && String(element.className).indexOf('update-link') !== -1);
+    }
+
+    function cortexwpUpdateForm(form) {
+        var action = String(form.getAttribute('action') || '').toLowerCase();
+        var formAction = String($(form).find('input[name="action"]').val() || '').toLowerCase();
+        var coreUpgrade = action.indexOf('update-core.php') !== -1 && (
+            $(form).find('[name="upgrade"], [name="do-core-upgrade"], [name="update-core"]').length > 0 ||
+            /update now|upgrade/.test(String($(form).find(':submit').text() || $(form).find(':submit').val() || '').toLowerCase())
+        );
+        return coreUpgrade ||
+            (action.indexOf('update.php') !== -1 && /upgrade-plugin|upgrade-theme|update-selected|do-core-upgrade/.test(formAction));
+    }
+
+    function cortexwpOpenUpdateModal(proceed) {
+        var $modal = $('#cortexwp-update-modal');
+        if (!$modal.length) {
+            $modal = $('<div id="cortexwp-update-modal" class="cortexwp-update-modal" role="dialog" aria-modal="true" aria-labelledby="cortexwp-update-modal-title">' +
+                '<div class="cortexwp-update-dialog">' +
+                    '<div class="cortexwp-update-dialog-head">' +
+                        '<div><p class="cortexwp-update-dialog-kicker">A safer update path</p>' +
+                        '<h2 id="cortexwp-update-modal-title">Update this on CortexWP?</h2>' +
+                        '<p class="cortexwp-update-dialog-copy">WordPress updates are dangerous! Updating from <b> <a href="https://app.cortexwp.ai" target=blank>CortexWP dashboard </a> </b> adds the safety net: a clear way back if something breaks, & a visual report of what changed in your pages.</p></div>' +
+                        '<button type="button" class="cortexwp-update-dialog-close" aria-label="Close">&times;</button>' +
+                    '</div>' +
+                    '<ul class="cortexwp-update-benefits">' +
+                        '<li>Take an automatic backup before the update starts.</li>' +
+                        '<li>Run visual regression checks and report page changes or breakage.</li>' +
+                        '<li>Keep a useful update history with rollback options.</li>' +
+                    '</ul>' +
+                    '<div class="cortexwp-update-dialog-foot">' +
+                        '<button type="button" class="cortexwp-update-continue">No thanks, continue here</button>' +
+                        '<button type="button" class="cortexwp-update-cancel">Ok, Cancel</button>' +
+                    '</div>' +
+                '</div>' +
+            '</div>').appendTo('body');
+        }
+
+        if ($modal.is(':visible')) {
+            return;
+        }
+
+        $modal.data('cortexwp-proceed', proceed).show();
+        $modal.find('.cortexwp-update-continue').trigger('focus');
+    }
+
+    $(document).on('click', '#cortexwp-update-modal .cortexwp-update-dialog-close, #cortexwp-update-modal .cortexwp-update-cancel', function () {
+        $('#cortexwp-update-modal').hide().removeData('cortexwp-proceed');
+    });
+    $(document).on('click', '#cortexwp-update-modal .cortexwp-update-continue', function () {
+        var proceed = $('#cortexwp-update-modal').data('cortexwp-proceed');
+        $('#cortexwp-update-modal').hide().removeData('cortexwp-proceed');
+        if (typeof proceed === 'function') proceed();
+    });
+    $(document).on('click', 'a[href]', function (event) {
+        if (!cortexwpManagedUpdates() || $(this).closest('#cortexwp-update-modal').length || this.dataset.cortexwpAllowed === '1' || !cortexwpUpdateAnchor(this)) return;
+        if (cortexwpInstallWordPressUpdateGuards() && $(this).closest('[data-plugin] .update-link, .themes-php .update-link, .update-now').length) return;
+        event.preventDefault();
+        var anchor = this;
+        cortexwpOpenUpdateModal(function () {
+            anchor.dataset.cortexwpAllowed = '1';
+            anchor.click();
+            window.setTimeout(function () { delete anchor.dataset.cortexwpAllowed; }, 0);
+        });
+    });
+    $(document).on('submit', 'form', function (event) {
+        if (!cortexwpManagedUpdates() || this.dataset.cortexwpAllowed === '1' || !cortexwpUpdateForm(this)) return;
+        event.preventDefault();
+        var form = this;
+        cortexwpOpenUpdateModal(function () {
+            form.dataset.cortexwpAllowed = '1';
+            HTMLFormElement.prototype.submit.call(form);
+            window.setTimeout(function () { delete form.dataset.cortexwpAllowed; }, 0);
+        });
+    });
+    $(document).on('keydown', function (event) {
+        if (event.key === 'Escape') $('#cortexwp-update-modal').hide().removeData('cortexwp-proceed');
+    });
+
+    $(function () {
+        cortexwpWatchForWordPressUpdateGuards(0);
+    });
 })(jQuery);
 JS;
     }
@@ -2065,67 +2477,33 @@ JS;
         }
 
         $key = self::connector_key();
-        $key_domain = self::key_domain();
-        $current_domain = self::current_domain();
-        $domain_mismatch = $key_domain !== $current_domain;
         ?>
-        <div class="wrap cortexwp-admin cortexwp-shell">
-            <div class="cortexwp-hero">
+        <div class="wrap cortexwp-admin cortexwp-shell cortexwp-connection-page">
+            <div class="cortexwp-hero cortexwp-connection-header">
                 <div>
-                    <p class="cortexwp-eyebrow">Secure connector</p>
-                    <h1>CortexWP Connector</h1>
-                    <p class="cortexwp-hero-copy">Use this API key to connect this WordPress site to CortexWP. The key is encrypted at rest and bound to the current site domain.</p>
+                    <p class="cortexwp-eyebrow">CortexWP connector</p>
+                    <h1>Connect this site</h1>
                 </div>
-                <a class="cortexwp-pill" href="https://cortexwp.ai" target="_blank" rel="noopener noreferrer">cortexwp.ai</a>
             </div>
 
-            <?php if ($domain_mismatch) : ?>
-                <div class="cortexwp-notice">
-                    <p>The connector key is bound to <?php echo esc_html($key_domain); ?>, but this site is currently <?php echo esc_html($current_domain); ?>. Regenerate the key before connecting this migrated domain.</p>
-                </div>
-            <?php endif; ?>
+            <section class="cortexwp-panel cortexwp-connection-fields" aria-label="CortexWP connection details">
+                <label class="cortexwp-connection-field">
+                    <span class="cortexwp-label">WordPress URL</span>
+                    <input type="text" readonly class="cortexwp-input" value="<?php echo esc_attr(home_url('/')); ?>" onclick="this.select();" aria-label="WordPress URL" />
+                </label>
 
-            <div class="cortexwp-grid">
-                <section class="cortexwp-panel cortexwp-key-card" aria-labelledby="cortexwp-connection-key-title">
-                    <div>
-                        <p class="cortexwp-eyebrow">Connection key</p>
-                        <h2 id="cortexwp-connection-key-title" class="cortexwp-section-title">Copy your CortexWP API key</h2>
-                        <p class="cortexwp-hero-copy">Paste this key into the CortexWP app with this site's WordPress URL. Regenerate it if the key was shared, exposed, or the site moved to a new domain.</p>
-                    </div>
-
+                <div class="cortexwp-connection-field">
+                    <label class="cortexwp-label" for="cortexwp-api-key">API key</label>
                     <div class="cortexwp-key-row">
                         <input id="cortexwp-api-key" type="text" readonly class="cortexwp-key-input code" value="<?php echo esc_attr($key); ?>" onclick="this.select();" aria-label="CortexWP API key" />
                         <button type="button" id="cortexwp-copy-key" class="button cortexwp-button">Copy key</button>
                         <button type="button" id="cortexwp-regenerate-key" class="button cortexwp-button cortexwp-button-primary">Regenerate key</button>
                     </div>
+                </div>
 
-                    <input type="hidden" id="cortexwp-regenerate-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_regenerate_key')); ?>" />
-                    <div id="cortexwp-key-status" class="cortexwp-status" role="status" aria-live="polite"></div>
-                </section>
-
-                <aside class="cortexwp-panel" aria-labelledby="cortexwp-site-details-title">
-                    <p class="cortexwp-eyebrow">Site details</p>
-                    <h2 id="cortexwp-site-details-title" class="cortexwp-section-title">Connector status</h2>
-                    <div class="cortexwp-meta-grid">
-                        <div class="cortexwp-meta-item">
-                            <span class="cortexwp-meta-label">WordPress URL</span>
-                            <span class="cortexwp-meta-value"><?php echo esc_html(home_url()); ?></span>
-                        </div>
-                        <div class="cortexwp-meta-item">
-                            <span class="cortexwp-meta-label">Key domain</span>
-                            <span id="cortexwp-key-domain" class="cortexwp-meta-value"><?php echo esc_html($key_domain); ?></span>
-                        </div>
-                        <div class="cortexwp-meta-item">
-                            <span class="cortexwp-meta-label">Current domain</span>
-                            <span id="cortexwp-current-domain" class="cortexwp-meta-value"><?php echo esc_html($current_domain); ?></span>
-                        </div>
-                        <div class="cortexwp-meta-item">
-                            <span class="cortexwp-meta-label">REST endpoint</span>
-                            <span class="cortexwp-meta-value"><?php echo esc_html(rest_url(self::ROUTE_NAMESPACE . '/status')); ?></span>
-                        </div>
-                    </div>
-                </aside>
-            </div>
+                <input type="hidden" id="cortexwp-regenerate-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_regenerate_key')); ?>" />
+                <div id="cortexwp-key-status" class="cortexwp-status" role="status" aria-live="polite"></div>
+            </section>
         </div>
         <?php
     }
@@ -2150,6 +2528,12 @@ JS;
                 </div>
                 <a href="<?php echo esc_url(admin_url('admin.php?page=cortexwp-ai-snippets&new=1')); ?>" class="button button-primary cortexwp-button cortexwp-button-primary">Add snippet</a>
             </div>
+
+            <?php if (isset($_GET['updated'])) : ?>
+                <div class="cortexwp-inline-notice cortexwp-inline-notice-success" role="status">Snippet saved.</div>
+            <?php elseif (isset($_GET['deleted'])) : ?>
+                <div class="cortexwp-inline-notice cortexwp-inline-notice-success" role="status">Snippet deleted.</div>
+            <?php endif; ?>
 
             <div class="cortexwp-stat-row">
                 <div class="cortexwp-stat">
@@ -2209,7 +2593,6 @@ JS;
                 <div>
                     <h2 class="cortexwp-section-title">PHP Snippets</h2>
                 </div>
-                <span class="cortexwp-pill"><?php echo esc_html(self::snippet_dir()); ?></span>
             </div>
 
             <?php if ($snippets) : ?>
@@ -2221,7 +2604,6 @@ JS;
                                 <div class="cortexwp-snippet-meta">
                                     <span class="cortexwp-badge <?php echo $snippet['enabled'] ? 'cortexwp-badge-enabled' : 'cortexwp-badge-disabled'; ?>"><?php echo $snippet['enabled'] ? 'Enabled' : 'Disabled'; ?></span>
                                     <span class="cortexwp-badge">Source: <?php echo esc_html($snippet['source']); ?></span>
-                                    <span><code><?php echo esc_html($snippet['file']); ?></code></span>
                                     <span>Modified <?php echo esc_html(get_date_from_gmt($snippet['modified'], 'M j, Y g:i a')); ?></span>
                                 </div>
                             </div>
@@ -2520,6 +2902,22 @@ JS;
                 return rest_ensure_response(self::security_login_events((array) ($params['filters'] ?? $params)));
             case 'security_login_events_clear':
                 return rest_ensure_response(self::clear_security_login_events());
+            case 'autopilot_update_policy':
+                $enabled = !empty($params['enabled']);
+                update_option(self::OPTION_AUTOPILOT_MANAGED, $enabled, false);
+                if ($enabled) {
+                    // Clear existing per-item selections so the native updater cannot
+                    // continue running a previously enabled plugin/theme auto-update.
+                    update_site_option('auto_update_plugins', []);
+                    update_site_option('auto_update_themes', []);
+                }
+
+                return rest_ensure_response([
+                    'managed' => $enabled,
+                    'plugin_auto_updates' => [],
+                    'theme_auto_updates' => [],
+                    'core_security_updates_allowed' => $enabled,
+                ]);
         }
 
         return new WP_Error('cortexwp_ai_unknown_action', 'Unknown CortexWP action.', ['status' => 400]);
@@ -3055,6 +3453,8 @@ JS;
             'security_hardening' => true,
             'security_login_monitor' => true,
             'component_backups' => true,
+            'updates_managed_by_cortexwp' => self::autopilot_managed(),
+            'core_security_updates_allowed' => self::autopilot_managed(),
             'recovery_bridge' => self::recovery_bridge_status(),
             'wp_cli_available' => self::wp_cli_available(),
         ];
@@ -3256,7 +3656,12 @@ JS;
         foreach (self::snippet_files() as $file) {
             $snippet = self::read_snippet_file($file);
             if (!empty($snippet['enabled'])) {
-                require_once $file;
+                try {
+                    require_once $file;
+                } catch (Throwable $error) {
+                    // A broken snippet must not prevent the connector from loading.
+                    error_log('CortexWP snippet failed to load (' . basename($file) . '): ' . $error->getMessage());
+                }
             }
         }
     }
@@ -3340,8 +3745,16 @@ JS;
 
         $files = glob(trailingslashit($dir) . '*.php') ?: [];
         sort($files);
-        return array_values(array_filter($files, static function (string $file): bool {
-            return is_readable($file) && !in_array(strtolower(basename($file)), ['index.php'], true);
+        $real_dir = realpath($dir);
+        if (!$real_dir) {
+            return [];
+        }
+
+        return array_values(array_filter($files, static function (string $file) use ($real_dir): bool {
+            return is_readable($file)
+                && !is_link($file)
+                && self::path_is_within($file, $real_dir)
+                && !in_array(strtolower(basename($file)), ['index.php'], true);
         }));
     }
 
@@ -3403,7 +3816,7 @@ JS;
             return new WP_Error('cortexwp_ai_snippet_dir', 'CortexWP snippets directory is not writable.', ['status' => 500]);
         }
 
-        $title = trim($title) ?: ucwords(str_replace(['-', '_'], ' ', $slug));
+        $title = sanitize_text_field(trim($title)) ?: ucwords(str_replace(['-', '_'], ' ', $slug));
         $enabled = array_key_exists('enabled', $options) ? (bool) $options['enabled'] : true;
         $source = sanitize_key((string) ($options['source'] ?? 'ai')) ?: 'ai';
 
@@ -3416,13 +3829,27 @@ JS;
         }
 
         $php = self::normalize_snippet_php($code);
+        $php = preg_replace('/^\s*(?:\/\/|#)\s*CortexWP\s+(?:Snippet|Enabled|Source):.*\R?/mi', '', $php) ?? $php;
+        $metadata = implode("\n", [
+            '// CortexWP Snippet: ' . $title,
+            '// CortexWP Enabled: ' . ($enabled ? 'yes' : 'no'),
+            '// CortexWP Source: ' . $source,
+            '',
+        ]);
+        $php = preg_replace_callback('/\A<\?php\s*/i', static function (array $matches) use ($metadata): string {
+            return $matches[0] . $metadata;
+        }, $php, 1) ?? $php;
         $path = self::snippet_path($slug);
+
+        if (is_link($path)) {
+            return new WP_Error('cortexwp_ai_snippet_symlink', 'Snippet path must not be a symbolic link.', ['status' => 400]);
+        }
 
         if (!self::php_lint($php)) {
             return new WP_Error('cortexwp_ai_snippet_syntax', 'Snippet failed PHP syntax validation.', ['status' => 400]);
         }
 
-        $written = file_put_contents($path, $php);
+        $written = file_put_contents($path, $php, LOCK_EX);
 
         if ($written === false) {
             return new WP_Error('cortexwp_ai_snippet_write', 'Unable to write snippet.', ['status' => 500]);
@@ -3484,6 +3911,10 @@ JS;
         }
 
         $path = self::snippet_path($slug);
+
+        if (is_link($path)) {
+            return new WP_Error('cortexwp_ai_snippet_symlink', 'Snippet path must not be a symbolic link.', ['status' => 400]);
+        }
 
         if (is_file($path) && !unlink($path)) {
             return new WP_Error('cortexwp_ai_snippet_delete', 'Unable to delete snippet.', ['status' => 500]);
@@ -5835,5 +6266,4 @@ PHP;
     }
 }
 
-register_uninstall_hook(__FILE__, ['CortexWP_AI_Connector', 'uninstall']);
 CortexWP_AI_Connector::boot();
