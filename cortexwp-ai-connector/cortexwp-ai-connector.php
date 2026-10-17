@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.4
+ * Version: 1.5
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -27,7 +27,7 @@ final class CortexWP_AI_Connector {
     private const RECOVERY_BRIDGE_PREFIX = 'cortexwp-recovery-';
     private const RECOVERY_BACKUP_DIR = 'cortexwp-recovery-backups';
     private const RECOVERY_AUDIT_DIR = 'cortexwp-recovery-audit';
-    private const SITE_HEALTH_CACHE_KEY = 'cortexwp_ai_site_health_cache_v1';
+    private const SITE_HEALTH_CACHE_KEY = 'cortexwp_ai_site_health_cache_v2';
     private const LOGIN_TABLE_VERSION = '2';
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
@@ -845,6 +845,21 @@ final class CortexWP_AI_Connector {
         return false;
     }
 
+    private static function site_health_security_salts_valid(): bool {
+        foreach (['AUTH_KEY', 'SECURE_AUTH_KEY', 'LOGGED_IN_KEY', 'NONCE_KEY'] as $constant) {
+            if (!defined($constant)) {
+                return false;
+            }
+
+            $value = trim((string) constant($constant));
+            if ($value === '' || stripos($value, 'put your unique phrase here') !== false) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static function site_health_scan(bool $force = false): array {
         if (!$force) {
             $cached = get_transient(self::SITE_HEALTH_CACHE_KEY);
@@ -855,6 +870,7 @@ final class CortexWP_AI_Connector {
         }
 
         $checks = [];
+        $hardening = self::hardening_settings();
         $home = home_url('/');
         $site = site_url('/');
         $uses_https = strpos($home, 'https://') === 0 && strpos($site, 'https://') === 0;
@@ -970,6 +986,187 @@ final class CortexWP_AI_Connector {
                 ? 'The connector can encrypt login monitor records before writing them to the local WordPress table.'
                 : 'Enable the PHP OpenSSL extension so login monitor records can be stored securely.',
             ['available' => $login_encryption_available]
+        );
+
+        $plugin_updates = get_site_transient('update_plugins');
+        $plugin_update_response = is_object($plugin_updates) && is_array($plugin_updates->response ?? null)
+            ? $plugin_updates->response
+            : [];
+        $checks[] = self::security_check(
+            'plugin-updates',
+            count($plugin_update_response) > 0 ? 'attention' : 'passed',
+            count($plugin_update_response) > 0
+                ? count($plugin_update_response) . ' plugin' . (count($plugin_update_response) === 1 ? '' : 's') . ' need' . (count($plugin_update_response) === 1 ? 's' : '') . ' an update'
+                : 'Plugins are up to date',
+            count($plugin_update_response) > 0
+                ? 'Review the available plugin updates and check the Vulnerabilities page for known security advisories before applying them.'
+                : 'WordPress does not currently report an available plugin update.',
+            ['count' => count($plugin_update_response)]
+        );
+
+        $theme_updates = get_site_transient('update_themes');
+        $theme_update_response = is_object($theme_updates) && is_array($theme_updates->response ?? null)
+            ? $theme_updates->response
+            : [];
+        $checks[] = self::security_check(
+            'theme-updates',
+            count($theme_update_response) > 0 ? 'attention' : 'passed',
+            count($theme_update_response) > 0
+                ? count($theme_update_response) . ' theme' . (count($theme_update_response) === 1 ? '' : 's') . ' need' . (count($theme_update_response) === 1 ? 's' : '') . ' an update'
+                : 'Themes are up to date',
+            count($theme_update_response) > 0
+                ? 'Review the available theme updates and keep an up-to-date fallback theme installed.'
+                : 'WordPress does not currently report an available theme update.',
+            ['count' => count($theme_update_response)]
+        );
+
+        $xmlrpc_enabled = (bool) apply_filters('xmlrpc_enabled', true);
+        $checks[] = self::security_check(
+            'xml-rpc',
+            $xmlrpc_enabled ? 'attention' : 'passed',
+            $xmlrpc_enabled ? 'XML-RPC is enabled' : 'XML-RPC is disabled',
+            $xmlrpc_enabled
+                ? 'XML-RPC is a common target for brute-force and pingback abuse. Disable it in Hardening if this site does not need it.'
+                : 'XML-RPC requests are disabled by the active security settings.',
+            ['enabled' => $xmlrpc_enabled]
+        );
+
+        $application_passwords_available = function_exists('wp_is_application_passwords_available')
+            ? (bool) wp_is_application_passwords_available()
+            : false;
+        $checks[] = self::security_check(
+            'application-passwords',
+            $application_passwords_available ? 'attention' : 'passed',
+            $application_passwords_available ? 'Application passwords are enabled' : 'Application passwords are unavailable',
+            $application_passwords_available
+                ? 'Review unused application passwords and disable this feature in Hardening if integrations do not need it.'
+                : 'WordPress is not making application passwords available to remote clients.',
+            ['available' => $application_passwords_available]
+        );
+
+        $users_can_register = (bool) get_option('users_can_register', 0);
+        $checks[] = self::security_check(
+            'user-registration',
+            $users_can_register ? 'attention' : 'passed',
+            $users_can_register ? 'Public user registration is enabled' : 'Public user registration is off',
+            $users_can_register
+                ? 'Open registration can attract spam accounts and abuse. Keep it enabled only when the site needs self-service sign-ups.'
+                : 'Visitors cannot create new WordPress accounts from the default registration flow.',
+            ['enabled' => $users_can_register]
+        );
+
+        $default_comment_status = (string) get_option('default_comment_status', 'open');
+        $comments_open = $default_comment_status === 'open';
+        $checks[] = self::security_check(
+            'comment-abuse',
+            $comments_open ? 'attention' : 'passed',
+            $comments_open ? 'New comments are open by default' : 'New comments are closed by default',
+            $comments_open
+                ? 'Open comments increase spam and moderation load. Confirm that comment protection and moderation rules are in place.'
+                : 'New posts do not accept comments by default.',
+            ['defaultStatus' => $default_comment_status]
+        );
+
+        $debug_log_enabled = defined('WP_DEBUG_LOG') && (bool) WP_DEBUG_LOG;
+        $debug_display_enabled = defined('WP_DEBUG_DISPLAY') && (bool) WP_DEBUG_DISPLAY;
+        $debug_public = $debug_log_enabled || $debug_display_enabled;
+        $checks[] = self::security_check(
+            'debug-output',
+            $debug_public ? 'attention' : 'passed',
+            $debug_public ? 'WordPress debug output is enabled' : 'WordPress debug output is off',
+            $debug_public
+                ? 'Debug logs or displayed errors can expose paths, queries, and other sensitive details. Keep debugging off on production sites.'
+                : 'Production visitors are not being shown WordPress debug output.',
+            ['log' => $debug_log_enabled, 'display' => $debug_display_enabled]
+        );
+
+        $salts_valid = self::site_health_security_salts_valid();
+        $checks[] = self::security_check(
+            'security-salts',
+            $salts_valid ? 'passed' : 'attention',
+            $salts_valid ? 'WordPress security salts are configured' : 'WordPress security salts need review',
+            $salts_valid
+                ? 'The core authentication and nonce salts are present and non-default.'
+                : 'Set unique AUTH_KEY, SECURE_AUTH_KEY, LOGGED_IN_KEY, and NONCE_KEY values in wp-config.php.',
+            ['configured' => $salts_valid]
+        );
+
+        $protectionChecks = [
+            [
+                'id' => 'author-enumeration',
+                'enabled' => !empty($hardening['block_user_enumeration']),
+                'title' => 'Author enumeration protection is enabled',
+                'description' => 'Block author probes so attackers have less help discovering usernames for password attacks.',
+                'setting' => 'block_user_enumeration',
+            ],
+            [
+                'id' => 'rest-user-listing',
+                'enabled' => !empty($hardening['block_rest_user_listing']),
+                'title' => 'REST user-listing protection is enabled',
+                'description' => 'Restrict unauthenticated REST user listings so public requests cannot collect account names.',
+                'setting' => 'block_rest_user_listing',
+            ],
+            [
+                'id' => 'login-rate-limit',
+                'enabled' => !empty($hardening['rate_limit_login']),
+                'title' => 'Login rate limiting is enabled',
+                'description' => 'Slow repeated failed sign-ins to reduce brute-force pressure against the login endpoint.',
+                'setting' => 'rate_limit_login',
+            ],
+            [
+                'id' => 'security-headers',
+                'enabled' => !empty($hardening['security_headers']),
+                'title' => 'Baseline security headers are enabled',
+                'description' => 'Send browser security headers that reduce framing, MIME-sniffing, and unnecessary capability risks.',
+                'setting' => 'security_headers',
+            ],
+        ];
+
+        foreach ($protectionChecks as $protection) {
+            $enabled = (bool) $protection['enabled'];
+            $checks[] = self::security_check(
+                (string) $protection['id'],
+                $enabled ? 'passed' : 'attention',
+                $enabled ? (string) $protection['title'] : str_replace(' is enabled', ' is not enabled', (string) $protection['title']),
+                $enabled
+                    ? (string) $protection['description']
+                    : (string) $protection['description'] . ' Enable the matching option in Hardening.',
+                ['enabled' => $enabled, 'setting' => (string) $protection['setting']]
+            );
+        }
+
+        $persistent_object_cache = function_exists('wp_using_ext_object_cache') && wp_using_ext_object_cache();
+        $checks[] = self::security_check(
+            'persistent-object-cache',
+            $persistent_object_cache ? 'passed' : 'attention',
+            $persistent_object_cache ? 'Persistent object cache is available' : 'No persistent object cache detected',
+            $persistent_object_cache
+                ? 'WordPress can reuse cached database results between requests.'
+                : 'A persistent object cache can reduce database work and improve response times on busy sites.',
+            ['enabled' => $persistent_object_cache]
+        );
+
+        $opcache_enabled = function_exists('opcache_get_status')
+            && in_array(strtolower((string) ini_get('opcache.enable')), ['1', 'on', 'true'], true);
+        $checks[] = self::security_check(
+            'php-opcache',
+            $opcache_enabled ? 'passed' : 'attention',
+            $opcache_enabled ? 'PHP OPcache is enabled' : 'PHP OPcache is not detected',
+            $opcache_enabled
+                ? 'PHP can reuse compiled scripts instead of compiling them on every request.'
+                : 'Enable PHP OPcache in the hosting environment to reduce PHP compilation work and improve response times.',
+            ['enabled' => $opcache_enabled]
+        );
+
+        $wp_cron_disabled = defined('DISABLE_WP_CRON') && (bool) DISABLE_WP_CRON;
+        $checks[] = self::security_check(
+            'wp-cron',
+            $wp_cron_disabled ? 'attention' : 'passed',
+            $wp_cron_disabled ? 'Built-in WP-Cron is disabled' : 'Built-in WP-Cron is available',
+            $wp_cron_disabled
+                ? 'Confirm that a server-side cron job is configured or scheduled tasks such as updates and backups may be delayed.'
+                : 'WordPress can run scheduled tasks through its built-in cron trigger.',
+            ['disabled' => $wp_cron_disabled]
         );
 
         $attention = array_values(array_filter($checks, static fn($check) => $check['status'] === 'attention'));
@@ -1948,9 +2145,8 @@ JS;
         <div class="wrap cortexwp-admin cortexwp-shell">
             <div class="cortexwp-hero">
                 <div>
-                    <p class="cortexwp-eyebrow">Managed PHP snippets</p>
                     <h1>CortexWP PHP Snippets</h1>
-                    <p class="cortexwp-hero-copy">Create, review, and control PHP snippets loaded by the CortexWP connector. Snippets saved from CortexWP and snippets created here use the same filesystem registry.</p>
+                    <p class="cortexwp-hero-copy">Create, review, and control PHP snippets loaded by the CortexWP.</p>
                 </div>
                 <a href="<?php echo esc_url(admin_url('admin.php?page=cortexwp-ai-snippets&new=1')); ?>" class="button button-primary cortexwp-button cortexwp-button-primary">Add snippet</a>
             </div>
@@ -2011,8 +2207,7 @@ JS;
 
             <div class="cortexwp-snippet-toolbar">
                 <div>
-                    <p class="cortexwp-eyebrow">Registry</p>
-                    <h2 class="cortexwp-section-title">Tracked snippets</h2>
+                    <h2 class="cortexwp-section-title">PHP Snippets</h2>
                 </div>
                 <span class="cortexwp-pill"><?php echo esc_html(self::snippet_dir()); ?></span>
             </div>
@@ -2052,7 +2247,7 @@ JS;
             <?php else : ?>
                 <div class="cortexwp-empty">
                     <strong>No snippets yet.</strong>
-                    <p>Create your first managed PHP snippet or let CortexWP add one during an approved task.</p>
+                    <p>Create your first managed PHP snippet or let CortexWP add one.</p>
                 </div>
             <?php endif; ?>
         </div>
