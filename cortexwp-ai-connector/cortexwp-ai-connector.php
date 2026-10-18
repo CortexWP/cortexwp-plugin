@@ -5294,7 +5294,7 @@ PHP;
 
     private static function encrypt_secret(string $value): string {
         if (!function_exists('openssl_encrypt')) {
-            throw new RuntimeException('OpenSSL is required to encrypt the CortexWP connector key.');
+            throw new RuntimeException('OpenSSL is required to encrypt the CortexWP API key.');
         }
 
         $iv = random_bytes(12);
@@ -5302,7 +5302,7 @@ PHP;
         $ciphertext = openssl_encrypt($value, 'aes-256-gcm', self::encryption_key(), OPENSSL_RAW_DATA, $iv, $tag);
 
         if ($ciphertext === false) {
-            throw new RuntimeException('Unable to encrypt the CortexWP connector key.');
+            throw new RuntimeException('Unable to encrypt the CortexWP API key.');
         }
 
         return implode(':', [
