@@ -2673,7 +2673,7 @@ JS;
                             <button type="button" id="cortexwp-copy-key" class="button cortexwp-button" disabled>Copy key</button>
                             <button type="button" id="cortexwp-regenerate-key" class="button cortexwp-button cortexwp-button-primary">Regenerate key</button>
                         </div>
-                        <p class="cortexwp-connection-help">The complete key is only revealed once. Regenerate it if you need a new key. Add this API key in your <a href="https://app.cortexwp.ai" target="_blank"> CortexWP Dashboard </a> -> Add Site</p>
+                        <p class="cortexwp-connection-help">The complete key is only revealed once. Regenerate it if you need a new key. <b> Add this API key in your <a href="https://app.cortexwp.ai" target="_blank"> CortexWP Dashboard </a> -> Add Site </b></p>
                     </div>
 
                     <input type="hidden" id="cortexwp-reveal-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_reveal_key')); ?>" />
