@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP Connector
  * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.7
+ * Version: 1.8
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -106,7 +106,9 @@ final class CortexWP_AI_Connector {
         self::ensure_login_events_table();
         self::ensure_recovery_bridge(true);
         add_option(self::OPTION_AUTOPILOT_MANAGED, false, '', false);
-        add_option(self::OPTION_KEY_VIEWED, false, '', false);
+        if (get_option(self::OPTION_KEY_VIEWED, null) === null) {
+            update_option(self::OPTION_KEY_VIEWED, false, false);
+        }
     }
 
     private static function maybe_ensure_recovery_bridge(): void {
@@ -210,7 +212,10 @@ final class CortexWP_AI_Connector {
     }
 
     private static function new_key(): string {
-        return 'cwp_' . bin2hex(random_bytes(32));
+        $site_url = site_url();
+        $encoded_site_url = rtrim(strtr(base64_encode($site_url), '+/', '-_'), '=');
+
+        return 'cwp_' . $encoded_site_url . '_' . bin2hex(random_bytes(32));
     }
 
     private static function plugin_version(): string {
@@ -354,12 +359,13 @@ final class CortexWP_AI_Connector {
         }
 
         // Before one-time reveal was introduced, the full key was rendered on
-        // every connection-page load. Treat existing keys as already viewed;
-        // only a regenerated key gets a fresh reveal window.
+        // every connection-page load, so there was no reliable viewed state to
+        // migrate. Give the existing key one reveal rather than locking the
+        // admin out before they have had a chance to copy it.
         if (get_option(self::OPTION_KEY, '')) {
-            update_option(self::OPTION_KEY_VIEWED, true, false);
+            update_option(self::OPTION_KEY_VIEWED, false, false);
         } else {
-            add_option(self::OPTION_KEY_VIEWED, false, '', false);
+            update_option(self::OPTION_KEY_VIEWED, false, false);
         }
     }
 
@@ -2659,11 +2665,6 @@ JS;
                     <h1>CortexWP Connector</h1>
                 </header>
                 <div class="cortexwp-connection-fields">
-                    <label class="cortexwp-connection-field">
-                        <span class="cortexwp-label">WordPress URL</span>
-                        <input type="text" readonly class="cortexwp-input" value="<?php echo esc_attr(home_url('/')); ?>" onclick="this.select();" aria-label="WordPress URL" />
-                    </label>
-
                     <div class="cortexwp-connection-field">
                         <label class="cortexwp-label" for="cortexwp-api-key">API key</label>
                         <div class="cortexwp-key-row">
@@ -2672,7 +2673,7 @@ JS;
                             <button type="button" id="cortexwp-copy-key" class="button cortexwp-button" disabled>Copy key</button>
                             <button type="button" id="cortexwp-regenerate-key" class="button cortexwp-button cortexwp-button-primary">Regenerate key</button>
                         </div>
-                        <p class="cortexwp-connection-help">Only the beginning of the key is shown here. The complete key is encrypted at rest and revealed once; regenerate it if you need to see a new key.</p>
+                        <p class="cortexwp-connection-help">The complete key is only revealed once. Regenerate it if you need a new key. Add this API key in your <a href="https://app.cortexwp.ai" target="_blank"> CortexWP Dashboard </a> -> Add Site</p>
                     </div>
 
                     <input type="hidden" id="cortexwp-reveal-nonce" value="<?php echo esc_attr(wp_create_nonce('cortexwp_ai_reveal_key')); ?>" />
@@ -2857,11 +2858,14 @@ JS;
 
         // Mark the credential as viewed before returning it. A page refresh can
         // never expose the same secret again through the WordPress UI.
-        if (!self::mark_key_viewed_once()) {
+        if (self::key_has_been_viewed()) {
             wp_send_json_error([
                 'message' => 'This API key has already been revealed. Regenerate the key to view a new one.',
             ], 409);
         }
+
+        self::mark_key_viewed_once();
+
         nocache_headers();
 
         wp_send_json_success([
@@ -5216,10 +5220,9 @@ PHP;
         add_option(self::OPTION_KEY_VIEWED, false, '', false);
 
         $updated = $wpdb->query($wpdb->prepare(
-            "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+            "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s",
             '1',
-            self::OPTION_KEY_VIEWED,
-            '0'
+            self::OPTION_KEY_VIEWED
         ));
 
         return $updated === 1;
