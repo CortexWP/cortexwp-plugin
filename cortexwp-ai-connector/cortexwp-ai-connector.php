@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: CortexWP Connector
- * Description: Securely connects a WordPress site to CortexWP.ai.
- * Version: 1.8
+ * Plugin Name: CortexWP - Manage WordPress with AI
+ * Description: Securely connects your WordPress site with CortexWP.ai Dashboard.
+ * Version: 2.0
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -33,7 +33,7 @@ final class CortexWP_AI_Connector {
     private const LOGIN_TABLE_VERSION = '2';
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
-    private const DEFAULT_APP_URL = 'http://127.0.0.1:3000';
+    private const DEFAULT_APP_URL = 'https://app.cortexwp.ai';
     private const CORTEXWP_SERVICE_IP = '40.233.109.6';
     private const FATAL_ERROR_ENDPOINT_PATH = '/api/wordpress/fatal-error';
     private static $reserved_memory = '';
