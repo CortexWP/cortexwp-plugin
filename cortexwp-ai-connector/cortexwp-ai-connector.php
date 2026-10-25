@@ -15,6 +15,8 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+require_once __DIR__ . '/includes/class-cortexwp-health-endpoints.php';
+
 final class CortexWP_AI_Connector {
     private const OPTION_KEY = 'cortexwp_ai_connector_key';
     private const OPTION_KEY_DOMAIN = 'cortexwp_ai_connector_key_domain';
@@ -62,6 +64,7 @@ final class CortexWP_AI_Connector {
         add_action('template_redirect', [__CLASS__, 'maybe_redirect_request'], 0);
         add_action('template_redirect', [__CLASS__, 'maybe_block_author_enumeration'], 1);
         add_action('rest_api_init', [__CLASS__, 'register_routes']);
+        add_action('rest_api_init', ['CortexWP_Health_Endpoints', 'register_routes']);
         add_action('wp_login', [__CLASS__, 'log_successful_login'], 10, 2);
         add_action('wp_login_failed', [__CLASS__, 'log_failed_login'], 10, 1);
         add_filter('authenticate', [__CLASS__, 'maybe_rate_limit_login'], 20, 3);
@@ -2981,6 +2984,13 @@ JS;
         ]);
     }
 
+    /** Per-site health credential derived from the existing connector key. */
+    public static function uptime_health_token(): string {
+        $key = self::connector_key();
+
+        return $key === '' ? '' : hash_hmac('sha256', 'cortexwp-uptime-health-v1', $key);
+    }
+
     public static function verify_request(WP_REST_Request $request) {
         $key = self::connector_key();
         $key_domain = self::key_domain();
@@ -3029,6 +3039,12 @@ JS;
             'wordpress_path' => ABSPATH,
             'connection_method' => 'plugin',
             'fatal_error_endpoint' => self::fatal_error_endpoint(),
+            'health_endpoints' => [
+                'database' => rest_url(self::ROUTE_NAMESPACE . '/health/database'),
+                'disk' => rest_url(self::ROUTE_NAMESPACE . '/health/disk'),
+                'external_http' => rest_url(self::ROUTE_NAMESPACE . '/health/external-http'),
+                'cron' => rest_url(self::ROUTE_NAMESPACE . '/health/cron'),
+            ],
             'capabilities' => self::capabilities(),
             'sftp' => null,
         ]);
