@@ -58,6 +58,7 @@ final class CortexWP_AI_Connector {
         add_action('plugins_loaded', [__CLASS__, 'load_snippets'], 20);
         add_action('init', [__CLASS__, 'maybe_upgrade_security_storage'], 1);
         add_action('init', [__CLASS__, 'maybe_upgrade_key_visibility'], 1);
+        add_action('init', [__CLASS__, 'ensure_managed_plugin_auto_update'], 1);
         add_action('init', [__CLASS__, 'maybe_whitelist_service_ip'], 20);
         add_action('admin_notices', [__CLASS__, 'admin_update_policy_notice']);
         add_action('send_headers', [__CLASS__, 'send_security_headers'], 1);
@@ -136,8 +137,35 @@ final class CortexWP_AI_Connector {
         return (bool) get_option(self::OPTION_AUTOPILOT_MANAGED, false);
     }
 
+    private static function connector_plugin_file(): string {
+        return plugin_basename(__FILE__);
+    }
+
+    private static function is_connector_plugin_item($item): bool {
+        $plugin_file = is_object($item) ? ($item->plugin ?? '') : (is_array($item) ? ($item['plugin'] ?? '') : '');
+        return (string) $plugin_file === self::connector_plugin_file();
+    }
+
+    public static function ensure_managed_plugin_auto_update(): void {
+        if (!self::autopilot_managed()) {
+            return;
+        }
+
+        $auto_updates = get_site_option('auto_update_plugins', []);
+        $auto_updates = is_array($auto_updates) ? $auto_updates : [];
+        $plugin_file = self::connector_plugin_file();
+
+        if (!in_array($plugin_file, $auto_updates, true) || count($auto_updates) !== 1) {
+            update_site_option('auto_update_plugins', [$plugin_file]);
+        }
+    }
+
     public static function disable_managed_plugin_auto_update($update, $item) {
-        return self::autopilot_managed() ? false : $update;
+        if (!self::autopilot_managed()) {
+            return $update;
+        }
+
+        return self::is_connector_plugin_item($item);
     }
 
     public static function disable_managed_theme_auto_update($update, $item) {
@@ -155,6 +183,10 @@ final class CortexWP_AI_Connector {
 
     public static function managed_plugin_auto_update_setting_html($html, $plugin_file, $plugin_data) {
         if (!self::autopilot_managed()) {
+            return $html;
+        }
+
+        if ((string) $plugin_file === self::connector_plugin_file()) {
             return $html;
         }
 
@@ -605,7 +637,13 @@ final class CortexWP_AI_Connector {
         return self::hardening_enabled('disable_application_passwords') ? false : $available;
     }
 
-    public static function block_file_editor_caps(array $caps, string $cap, int $user_id, array $args): array {
+    public static function block_file_editor_caps(array $caps, ?string $cap, int $user_id, array $args): array {
+        // Some WordPress/plugin call paths can pass a null meta capability.
+        // Preserve the mapped capabilities instead of failing on the type declaration.
+        if ($cap === null) {
+            return $caps;
+        }
+
         if (!self::hardening_enabled('disable_file_editor')) {
             return $caps;
         }
@@ -2482,6 +2520,41 @@ CSS;
         return document.body && document.body.classList.contains('cortexwp-updates-managed');
     }
 
+    function cortexwpIsConnectorTarget(value) {
+        if (value && typeof value === 'object') {
+            return cortexwpIsConnectorTarget(value.plugin) || cortexwpIsConnectorTarget(value.file);
+        }
+
+        var target = String(value || '');
+        try {
+            target = decodeURIComponent(target);
+        } catch (error) {}
+
+        return target.indexOf('cortexwp-ai-connector/cortexwp-ai-connector.php') !== -1;
+    }
+
+    function cortexwpIsConnectorElement(element) {
+        var $element = $(element);
+        var $pluginScope = $element.closest('[data-plugin]');
+        return cortexwpIsConnectorTarget($pluginScope.attr('data-plugin')) ||
+            cortexwpIsConnectorTarget($element.attr('href'));
+    }
+
+    function cortexwpIsConnectorForm(form) {
+        if (cortexwpIsConnectorElement(form)) {
+            return true;
+        }
+
+        var targets = [];
+        $(form).find('input[name="plugin"], input[name="checked[]"]').each(function () {
+            if (this.checked !== false || this.name === 'plugin') {
+                targets.push(String(this.value || ''));
+            }
+        });
+
+        return targets.length === 1 && cortexwpIsConnectorTarget(targets[0]);
+    }
+
     var cortexwpNativeUpdateCall = false;
 
     function cortexwpIsUpdateAction(action) {
@@ -2509,6 +2582,10 @@ CSS;
                 var context = this;
                 var args = arguments;
 
+                if (method === 'updatePlugin' && cortexwpIsConnectorTarget(args[0])) {
+                    return original.apply(context, args);
+                }
+
                 cortexwpOpenUpdateModal(function () {
                     cortexwpNativeUpdateCall = true;
                     try {
@@ -2528,6 +2605,10 @@ CSS;
         if (typeof updates.ajax === 'function' && !updates.ajax.cortexwpGuarded) {
             var originalAjax = updates.ajax;
             var guardedAjax = function (action, data) {
+                if (action === 'update-plugin' && cortexwpIsConnectorTarget(data)) {
+                    return originalAjax.apply(this, arguments);
+                }
+
                 if (!cortexwpNativeUpdateCall && cortexwpIsUpdateAction(action)) {
                     var context = this;
                     var args = arguments;
@@ -2624,6 +2705,7 @@ CSS;
     });
     $(document).on('click', 'a[href]', function (event) {
         if (!cortexwpManagedUpdates() || $(this).closest('#cortexwp-update-modal').length || this.dataset.cortexwpAllowed === '1' || !cortexwpUpdateAnchor(this)) return;
+        if (cortexwpIsConnectorElement(this)) return;
         if (cortexwpInstallWordPressUpdateGuards() && $(this).closest('[data-plugin] .update-link, .themes-php .update-link, .update-now').length) return;
         event.preventDefault();
         var anchor = this;
@@ -2635,6 +2717,7 @@ CSS;
     });
     $(document).on('submit', 'form', function (event) {
         if (!cortexwpManagedUpdates() || this.dataset.cortexwpAllowed === '1' || !cortexwpUpdateForm(this)) return;
+        if (cortexwpIsConnectorForm(this)) return;
         event.preventDefault();
         var form = this;
         cortexwpOpenUpdateModal(function () {
@@ -3140,15 +3223,14 @@ JS;
                 $enabled = !empty($params['enabled']);
                 update_option(self::OPTION_AUTOPILOT_MANAGED, $enabled, false);
                 if ($enabled) {
-                    // Clear existing per-item selections so the native updater cannot
-                    // continue running a previously enabled plugin/theme auto-update.
-                    update_site_option('auto_update_plugins', []);
+                    // CortexWP is the only plugin allowed to auto-update under managed mode.
+                    update_site_option('auto_update_plugins', [self::connector_plugin_file()]);
                     update_site_option('auto_update_themes', []);
                 }
 
                 return rest_ensure_response([
                     'managed' => $enabled,
-                    'plugin_auto_updates' => [],
+                    'plugin_auto_updates' => $enabled ? [self::connector_plugin_file()] : [],
                     'theme_auto_updates' => [],
                     'core_security_updates_allowed' => $enabled,
                 ]);
