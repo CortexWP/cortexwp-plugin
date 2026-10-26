@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP - Manage WordPress with AI
  * Description: Securely connects your WordPress site with CortexWP.ai Dashboard.
- * Version: 2.0
+ * Version: 2.1
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
