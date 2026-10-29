@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP - Manage WordPress with AI
  * Description: Securely connects your WordPress site with CortexWP.ai Dashboard.
- * Version: 2.1
+ * Version: 2.2
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -3152,6 +3152,10 @@ JS;
                 return rest_ensure_response(self::list_directory((string) ($params['path'] ?? ABSPATH)));
             case 'php_environment':
                 return rest_ensure_response(self::php_environment());
+            case 'inspect_path':
+                return rest_ensure_response(self::inspect_path((string) ($params['path'] ?? '')));
+            case 'inspect_dropin':
+                return rest_ensure_response(self::inspect_dropin((string) ($params['name'] ?? 'advanced-cache.php')));
             case 'patch_file':
                 return rest_ensure_response(self::patch_file(
                     (string) ($params['path'] ?? ''),
@@ -4554,6 +4558,159 @@ JS;
                 'safe_file_patch' => true,
                 'recovery_bridge' => self::recovery_bridge_status(),
             ],
+        ];
+    }
+
+    private static function inspect_dropin(string $name = 'advanced-cache.php'): array {
+        $name = basename(trim($name));
+        if (!in_array($name, ['advanced-cache.php', 'object-cache.php', 'db.php', 'sunrise.php'], true)) {
+            return ['error' => 'Unsupported WordPress drop-in.'];
+        }
+
+        $path = trailingslashit(WP_CONTENT_DIR) . $name;
+        $exists = is_file($path);
+        $contents = $exists && is_readable($path) ? (string) @file_get_contents($path) : '';
+        $dropins = function_exists('get_dropins') ? get_dropins() : [];
+        $active_plugins = (array) get_option('active_plugins', []);
+        $seraphinite = [];
+        if (function_exists('get_plugins')) {
+            foreach (get_plugins() as $plugin_file => $plugin) {
+                $text = strtolower($plugin_file . ' ' . ($plugin['Name'] ?? ''));
+                if (strpos($text, 'seraphinite') !== false) {
+                    $seraphinite[] = [
+                        'file' => $plugin_file,
+                        'name' => $plugin['Name'] ?? '',
+                        'version' => $plugin['Version'] ?? '',
+                        'active' => in_array($plugin_file, $active_plugins, true),
+                    ];
+                }
+            }
+        }
+
+        return [
+            'path' => self::public_site_path($path),
+            'absolute_path' => $path,
+            'exists' => $exists,
+            'is_file' => $exists,
+            'readable' => $exists && is_readable($path),
+            'writable' => $exists ? is_writable($path) : is_writable(WP_CONTENT_DIR),
+            'directory_writable' => is_writable(WP_CONTENT_DIR),
+            'size' => $exists ? (int) @filesize($path) : 0,
+            'permissions' => $exists ? substr(sprintf('%o', @fileperms($path)), -4) : null,
+            'sha256' => $contents !== '' ? hash('sha256', $contents) : null,
+            'content_readable' => $contents !== '',
+            'content_contains_seraphinite' => stripos($contents, 'seraphinite') !== false,
+            'wordpress_dropin' => $dropins[$name] ?? null,
+            'registered_as_dropin' => array_key_exists($name, $dropins),
+            'wp_cache' => defined('WP_CACHE') ? (bool) WP_CACHE : null,
+            'seraphinite_plugins' => $seraphinite,
+        ];
+    }
+
+    private static function inspect_path(string $requested): array {
+        $requested = trim($requested);
+        $path = self::safe_path($requested);
+        if (!$path) {
+            return [
+                'requested_path' => $requested,
+                'exists' => false,
+                'accessible_path' => false,
+                'reason' => 'The path does not exist or is outside the WordPress installation.',
+            ];
+        }
+
+        $is_file = is_file($path);
+        $is_dir = is_dir($path);
+        $mode = @fileperms($path);
+        $owner = function_exists('posix_getpwuid') ? @posix_getpwuid((int) @fileowner($path)) : false;
+        $component = 'site file';
+        $normalized = str_replace('\\', '/', $path);
+        $root = rtrim(str_replace('\\', '/', ABSPATH), '/') . '/';
+        $relative = ltrim(str_replace('\\', '/', substr($normalized, strlen($root))), '/');
+        $content_root = rtrim(str_replace('\\', '/', WP_CONTENT_DIR), '/');
+        $plugin_root = rtrim(str_replace('\\', '/', defined('WP_PLUGIN_DIR') ? WP_PLUGIN_DIR : ''), '/');
+        $mu_plugin_root = rtrim(str_replace('\\', '/', defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : ''), '/');
+        $theme_root = function_exists('get_theme_root') ? rtrim(str_replace('\\', '/', get_theme_root()), '/') : '';
+        $upload_root = function_exists('wp_upload_dir') ? rtrim(str_replace('\\', '/', (string) (wp_upload_dir()['basedir'] ?? '')), '/') : '';
+        $starts_with = static function (string $value, string $prefix): bool {
+            return $prefix !== '' && ($value === $prefix || strpos($value, $prefix . '/') === 0);
+        };
+        $is_core = !$starts_with($normalized, $content_root) && (
+            strpos($relative, 'wp-admin/') === 0 || strpos($relative, 'wp-includes/') === 0 ||
+            in_array($relative, ['index.php', 'wp-settings.php', 'wp-load.php', 'wp-blog-header.php'], true)
+        );
+        if ($is_core) {
+            $component = 'WordPress core';
+        } elseif ($starts_with($normalized, $plugin_root)) {
+            $component = 'plugin';
+        } elseif ($starts_with($normalized, $theme_root)) {
+            $component = 'theme';
+        } elseif ($starts_with($normalized, $mu_plugin_root)) {
+            $component = 'must-use plugin';
+        } elseif ($starts_with($normalized, $upload_root)) {
+            $component = 'uploads/media';
+        } elseif ($starts_with($normalized, $content_root) && $is_file) {
+            $component = 'WordPress content/drop-in file';
+        }
+
+        $active = null;
+        $boot_critical = false;
+        $load_phase = 'not determined';
+        $failure_scope = 'unknown until the loading path is verified';
+        $core_bootstrap = ['index.php', 'wp-settings.php', 'wp-load.php', 'wp-blog-header.php'];
+        if ($component === 'WordPress core') {
+            $boot_critical = in_array($relative, $core_bootstrap, true);
+            $load_phase = $boot_critical ? 'WordPress bootstrap' : 'WordPress core load (file-specific)';
+            $failure_scope = $boot_critical ? 'can prevent the entire WordPress request from booting' : 'can break requests that load this core file';
+        } elseif ($component === 'must-use plugin') {
+            $active = true;
+            $boot_critical = true;
+            $load_phase = 'early WordPress plugin bootstrap';
+            $failure_scope = 'site-wide when WordPress loads must-use plugins';
+        } elseif ($component === 'WordPress content/drop-in file') {
+            $active = in_array(strtolower(basename($relative)), ['advanced-cache.php', 'object-cache.php', 'db.php', 'sunrise.php', 'maintenance.php'], true);
+            $boot_critical = $active;
+            $load_phase = $active ? 'WordPress drop-in/bootstrap' : 'content file load not established';
+            $failure_scope = $active ? 'can prevent the entire WordPress request from booting' : 'depends on whether another component loads this file';
+        } elseif ($component === 'plugin') {
+            $plugin_relative = ltrim(substr($normalized, strlen($plugin_root)), '/');
+            $plugin_root = explode('/', $plugin_relative)[0] ?? '';
+            $active_plugins = (array) get_option('active_plugins', []);
+            if (function_exists('get_plugins')) {
+                foreach (get_plugins() as $plugin_file => $plugin) {
+                    if (strpos($plugin_file, $plugin_root . '/') === 0 || $plugin_file === $plugin_root) {
+                        $active = in_array($plugin_file, $active_plugins, true);
+                        break;
+                    }
+                }
+            }
+            $load_phase = $active === true ? 'active plugin bootstrap/runtime' : 'plugin file load not established';
+            $failure_scope = $active === true ? 'can break the full site when this plugin loads' : 'normally not site-wide unless another file loads it';
+        } elseif ($component === 'theme') {
+            $active = strpos(str_replace('\\', '/', $path), trailingslashit(str_replace('\\', '/', get_stylesheet_directory()))) === 0
+                || strpos(str_replace('\\', '/', $path), trailingslashit(str_replace('\\', '/', get_template_directory()))) === 0;
+            $load_phase = $active ? 'active theme bootstrap/rendering' : 'theme file load not established';
+            $failure_scope = $active ? 'can break front-end requests and may affect the full site' : 'normally not site-wide unless selected or loaded by another component';
+        }
+
+        return [
+            'requested_path' => $requested,
+            'path' => self::public_site_path($path),
+            'component' => $component,
+            'active_or_loaded' => $active,
+            'boot_critical' => $boot_critical,
+            'load_phase' => $load_phase,
+            'failure_scope' => $failure_scope,
+            'exists' => true,
+            'is_file' => $is_file,
+            'is_directory' => $is_dir,
+            'readable' => is_readable($path),
+            'writable' => is_writable($path),
+            'size' => $is_file ? (int) @filesize($path) : null,
+            'permissions' => $mode === false ? null : substr(sprintf('%o', $mode), -4),
+            'owner' => is_array($owner) ? ($owner['name'] ?? null) : null,
+            'group' => function_exists('posix_getgrgid') ? ((@posix_getgrgid((int) @filegroup($path))['name'] ?? null)) : null,
+            'sha256' => $is_file && is_readable($path) ? hash_file('sha256', $path) : null,
         ];
     }
 
