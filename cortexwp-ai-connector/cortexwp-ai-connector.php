@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP - Manage WordPress with AI
  * Description: Securely connects your WordPress site with CortexWP.ai Dashboard.
- * Version: 2.2
+ * Version: 2.3
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -22,6 +22,7 @@ final class CortexWP_AI_Connector {
     private const OPTION_KEY_DOMAIN = 'cortexwp_ai_connector_key_domain';
     private const OPTION_KEY_VIEWED = 'cortexwp_ai_connector_key_viewed';
     private const OPTION_SETTINGS = 'cortexwp_ai_connector_settings';
+    private const OPTION_UPDATE_TASKS = 'cortexwp_ai_update_tasks_v1';
     private const OPTION_AUTOPILOT_MANAGED = 'cortexwp_ai_autopilot_managed';
     private const OPTION_SECURITY_HARDENING = 'cortexwp_ai_security_hardening';
     private const OPTION_LOGIN_TABLE_VERSION = 'cortexwp_ai_login_table_version';
@@ -58,6 +59,7 @@ final class CortexWP_AI_Connector {
         add_action('plugins_loaded', [__CLASS__, 'load_snippets'], 20);
         add_action('init', [__CLASS__, 'maybe_upgrade_security_storage'], 1);
         add_action('init', [__CLASS__, 'maybe_upgrade_key_visibility'], 1);
+        add_action('init', [__CLASS__, 'run_update_tasks'], 1);
         add_action('init', [__CLASS__, 'ensure_managed_plugin_auto_update'], 1);
         add_action('init', [__CLASS__, 'maybe_whitelist_service_ip'], 20);
         add_action('admin_notices', [__CLASS__, 'admin_update_policy_notice']);
@@ -108,6 +110,7 @@ final class CortexWP_AI_Connector {
 
         self::ensure_snippet_dir();
         self::ensure_login_events_table();
+        self::run_update_tasks();
         self::ensure_recovery_bridge(true);
         add_option(self::OPTION_AUTOPILOT_MANAGED, false, '', false);
         if (get_option(self::OPTION_KEY_VIEWED, null) === null) {
@@ -119,6 +122,67 @@ final class CortexWP_AI_Connector {
         if (self::should_check_recovery_bridge_on_boot()) {
             self::ensure_recovery_bridge(false);
         }
+    }
+
+    /**
+     * Extensible plugin update-task registry.
+     *
+     * Add one immutable task ID and one idempotent callback to
+     * update_task_definitions() for each future migration. Never rename or
+     * reuse an existing task ID. A task is marked complete only after its
+     * callback returns true; failures remain retryable on the next request.
+     * Keep tasks small, site-safe, and independent of admin-only hooks because
+     * this runner is also used during activation and normal plugin boot.
+     */
+    public static function run_update_tasks(): void {
+        $completed = get_option(self::OPTION_UPDATE_TASKS, []);
+        if (!is_array($completed)) {
+            $completed = [];
+        }
+
+        foreach (self::update_task_definitions() as $task_id => $task) {
+            if (($completed[$task_id] ?? false) === true) {
+                continue;
+            }
+
+            $callback = $task['callback'] ?? '';
+            if (!is_string($callback) || !method_exists(__CLASS__, $callback)) {
+                error_log('CortexWP update task is invalid: ' . sanitize_key((string) $task_id));
+                continue;
+            }
+
+            try {
+                if (!call_user_func([__CLASS__, $callback])) {
+                    continue;
+                }
+
+                $completed[$task_id] = true;
+                update_option(self::OPTION_UPDATE_TASKS, $completed, false);
+            } catch (Throwable $error) {
+                error_log(
+                    'CortexWP update task failed [' . sanitize_key((string) $task_id) . ']: ' .
+                    self::truncate((string) $error->getMessage(), 1000)
+                );
+            }
+        }
+    }
+
+    private static function update_task_definitions(): array {
+        // Future plugin migrations belong here. Add a new, never-reused task
+        // ID and an idempotent private callback; do not put one-off migration
+        // calls directly in boot() or activate(). Return true only after the
+        // complete change is verified so failed tasks remain retryable.
+        return [
+            '2.3.0-recovery-bridge-template-v3' => [
+                'callback' => 'update_task_recovery_bridge_template_v3',
+            ],
+        ];
+    }
+
+    private static function update_task_recovery_bridge_template_v3(): bool {
+        $status = self::ensure_recovery_bridge(false);
+        return ($status['installed'] ?? false) === true
+            && self::recovery_bridge_has_template_marker();
     }
 
     public static function maybe_whitelist_service_ip(): void {
@@ -4841,7 +4905,9 @@ JS;
 
         if (!$force) {
             if (is_file($path) && is_readable($path)) {
-                return self::recovery_bridge_status();
+                if (self::recovery_bridge_has_template_marker()) {
+                    return self::recovery_bridge_status();
+                }
             }
         }
 
@@ -4870,6 +4936,16 @@ JS;
         return self::recovery_bridge_status();
     }
 
+    private static function recovery_bridge_has_template_marker(): bool {
+        $path = self::recovery_bridge_path();
+        if (!is_file($path) || !is_readable($path)) {
+            return false;
+        }
+
+        $contents = @file_get_contents($path);
+        return is_string($contents) && strpos($contents, 'CORTEXWP_RECOVERY_TEMPLATE_V3') !== false;
+    }
+
     private static function recovery_bridge_php(): string {
         $secret_export = var_export(self::recovery_secret(), true);
         $version_export = var_export(self::plugin_version(), true);
@@ -4878,6 +4954,8 @@ JS;
         $template = <<<'PHP'
 <?php
 declare(strict_types=1);
+
+// CORTEXWP_RECOVERY_TEMPLATE_V3
 
 define('CORTEXWP_RECOVERY_SECRET', %%SECRET%%);
 define('CORTEXWP_RECOVERY_VERSION', %%VERSION%%);
@@ -4950,15 +5028,47 @@ function cwp_dir(string $name): string {
     return CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content' . DIRECTORY_SEPARATOR . $name;
 }
 
+function cwp_fallback_dir(string $name): string {
+    $temp = function_exists('sys_get_temp_dir') ? trim((string) sys_get_temp_dir()) : '';
+    if ($temp === '') {
+        return '';
+    }
+
+    $suffix = substr(hash_hmac('sha256', $name, CORTEXWP_RECOVERY_SECRET), 0, 24);
+    return rtrim($temp, '/\\') . DIRECTORY_SEPARATOR . 'cortexwp-recovery-' . $suffix;
+}
+
+function cwp_existing_storage_dir(string $name): string {
+    $primary = cwp_dir($name);
+    if (is_dir($primary)) {
+        return $primary;
+    }
+
+    $fallback = cwp_fallback_dir($name);
+    return $fallback !== '' && is_dir($fallback) ? $fallback : $primary;
+}
+
 function cwp_ensure_dir(string $name): string {
     $dir = cwp_dir($name);
 
-    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
-        cwp_fail('Recovery storage directory is not writable.', 500);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
     }
 
-    if (!is_writable($dir)) {
-        cwp_fail('Recovery storage directory is not writable.', 500);
+    if (!is_dir($dir) || !is_writable($dir)) {
+        $fallback = cwp_fallback_dir($name);
+        if ($fallback === '') {
+            cwp_fail('Recovery storage directory is not writable.', 500);
+        }
+
+        $dir = $fallback;
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0700, true);
+        }
+
+        if (!is_dir($dir) || !is_writable($dir)) {
+            cwp_fail('Recovery storage directory is not writable.', 500);
+        }
     }
 
     cwp_protect_dir($dir);
@@ -4981,7 +5091,7 @@ function cwp_audit(string $action, array $details = [], string $status = 'succee
 
 function cwp_audit_log(int $limit = 50): array {
     $limit = max(1, min(200, $limit));
-    $dir = cwp_dir('cortexwp-recovery-audit');
+    $dir = cwp_existing_storage_dir('cortexwp-recovery-audit');
 
     if (!is_dir($dir)) {
         return ['entries' => []];
