@@ -74,3 +74,20 @@ foreach (glob(rtrim(ABSPATH, '/\\') . DIRECTORY_SEPARATOR . 'cortexwp-recovery-*
         @unlink($bridge);
     }
 }
+
+$early_loader = defined('WPMU_PLUGIN_DIR')
+    ? rtrim(WPMU_PLUGIN_DIR, '/\\') . DIRECTORY_SEPARATOR . '000-cortexwp-ai-connector-loader.php'
+    : WP_CONTENT_DIR . DIRECTORY_SEPARATOR . 'mu-plugins' . DIRECTORY_SEPARATOR . '000-cortexwp-ai-connector-loader.php';
+
+if (is_file($early_loader) && is_writable($early_loader)) {
+    $contents = @file_get_contents($early_loader);
+    if (
+        is_string($contents)
+        && (
+            strpos($contents, 'CORTEXWP_EARLY_FATAL_LOADER_V1') !== false
+            || strpos($contents, 'CORTEXWP_EARLY_FATAL_LOADER_V2') !== false
+        )
+    ) {
+        @unlink($early_loader);
+    }
+}

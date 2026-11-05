@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP - Manage WordPress with AI
  * Description: Securely connects your WordPress site with CortexWP.ai Dashboard.
- * Version: 2.3
+ * Version: 2.4
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -15,7 +15,17 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-require_once __DIR__ . '/includes/class-cortexwp-health-endpoints.php';
+if (!defined('CORTEXWP_AI_CONNECTOR_APP_URL')) {
+    $cortexwp_site_url = defined('WP_HOME') ? (string) WP_HOME : '';
+    if ($cortexwp_site_url === '' && function_exists('home_url')) {
+        $cortexwp_site_url = (string) home_url('/');
+    }
+
+    $cortexwp_site_host = parse_url($cortexwp_site_url, PHP_URL_HOST);
+    if (is_string($cortexwp_site_host) && preg_match('/(?:^|\.)local$/i', $cortexwp_site_host)) {
+        define('CORTEXWP_AI_CONNECTOR_APP_URL', 'http://127.0.0.1:3000');
+    }
+}
 
 final class CortexWP_AI_Connector {
     private const OPTION_KEY = 'cortexwp_ai_connector_key';
@@ -36,14 +46,17 @@ final class CortexWP_AI_Connector {
     private const LOGIN_TABLE_VERSION = '2';
     private const RELEASE_ASSET = 'cortexwp-ai-connector.zip';
     private const UPDATE_CACHE_KEY = 'cortexwp_ai_connector_release';
+    private const EARLY_FATAL_LOADER = '000-cortexwp-ai-connector-loader.php';
     private const DEFAULT_APP_URL = 'https://app.cortexwp.ai';
     private const CORTEXWP_SERVICE_IP = '40.233.109.6';
     private const FATAL_ERROR_ENDPOINT_PATH = '/api/wordpress/fatal-error';
     private static $reserved_memory = '';
+    private static $fatal_error_handler_registered = false;
     private static $login_rate_limited = false;
     private static $rate_limit_logged = false;
 
     public static function boot(): void {
+        self::register_fatal_error_handler();
         self::$reserved_memory = str_repeat('x', 262144);
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
         add_action('admin_enqueue_scripts', [__CLASS__, 'admin_assets']);
@@ -88,8 +101,8 @@ final class CortexWP_AI_Connector {
         add_filter('theme_auto_update_setting_template', [__CLASS__, 'managed_theme_auto_update_setting_template'], 999);
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_for_plugin_update']);
         add_filter('plugins_api', [__CLASS__, 'plugin_update_details'], 10, 3);
-        register_shutdown_function([__CLASS__, 'capture_fatal_error']);
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
+        register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate']);
         self::maybe_ensure_recovery_bridge();
     }
 
@@ -116,6 +129,19 @@ final class CortexWP_AI_Connector {
         if (get_option(self::OPTION_KEY_VIEWED, null) === null) {
             update_option(self::OPTION_KEY_VIEWED, false, false);
         }
+    }
+
+    public static function deactivate(): void {
+        self::remove_early_fatal_loader();
+    }
+
+    private static function register_fatal_error_handler(): void {
+        if (self::$fatal_error_handler_registered) {
+            return;
+        }
+
+        self::$fatal_error_handler_registered = true;
+        register_shutdown_function([__CLASS__, 'capture_fatal_error']);
     }
 
     private static function maybe_ensure_recovery_bridge(): void {
@@ -173,10 +199,118 @@ final class CortexWP_AI_Connector {
         // calls directly in boot() or activate(). Return true only after the
         // complete change is verified so failed tasks remain retryable.
         return [
+            '2.3.0-early-fatal-loader-v1' => [
+                'callback' => 'update_task_early_fatal_loader_v1',
+            ],
+            '2.4.0-early-fatal-loader-v2' => [
+                'callback' => 'update_task_early_fatal_loader_v2',
+            ],
             '2.3.0-recovery-bridge-template-v3' => [
                 'callback' => 'update_task_recovery_bridge_template_v3',
             ],
         ];
+    }
+
+    private static function update_task_early_fatal_loader_v1(): bool {
+        return self::install_early_fatal_loader();
+    }
+
+    private static function update_task_early_fatal_loader_v2(): bool {
+        return self::install_early_fatal_loader();
+    }
+
+    private static function early_fatal_loader_path(): string {
+        return trailingslashit(WPMU_PLUGIN_DIR) . self::EARLY_FATAL_LOADER;
+    }
+
+    private static function install_early_fatal_loader(): bool {
+        if (!defined('WPMU_PLUGIN_DIR')) {
+            return false;
+        }
+
+        $directory = WPMU_PLUGIN_DIR;
+        if (!is_dir($directory) && !wp_mkdir_p($directory)) {
+            return false;
+        }
+
+        $path = self::early_fatal_loader_path();
+        if (is_file($path)) {
+            $contents = @file_get_contents($path);
+            if (is_string($contents) && strpos($contents, 'CORTEXWP_EARLY_FATAL_LOADER_V2') !== false) {
+                return true;
+            }
+
+            if (!is_string($contents) || strpos($contents, 'CORTEXWP_EARLY_FATAL_LOADER_V1') === false || !is_writable($path)) {
+                return false;
+            }
+        } elseif (!is_writable($directory)) {
+            return false;
+        }
+
+        return file_put_contents($path, self::early_fatal_loader_php(), LOCK_EX) !== false;
+    }
+
+    private static function remove_early_fatal_loader(): void {
+        if (!defined('WPMU_PLUGIN_DIR')) {
+            return;
+        }
+
+        $path = self::early_fatal_loader_path();
+        if (!is_file($path) || !is_writable($path)) {
+            return;
+        }
+
+        $contents = @file_get_contents($path);
+        if (
+            is_string($contents)
+            && (
+                strpos($contents, 'CORTEXWP_EARLY_FATAL_LOADER_V1') !== false
+                || strpos($contents, 'CORTEXWP_EARLY_FATAL_LOADER_V2') !== false
+            )
+        ) {
+            unlink($path);
+        }
+    }
+
+    private static function early_fatal_loader_php(): string {
+        $plugin_path = WP_PLUGIN_DIR . '/' . self::connector_plugin_file();
+        $plugin_basename = self::connector_plugin_file();
+
+        return "<?php\n"
+            . "// CORTEXWP_EARLY_FATAL_LOADER_V2\n"
+            . "if (defined('ABSPATH')) {\n"
+            . '    $cortexwp_connector = ' . var_export($plugin_path, true) . ";\n"
+            . '    $cortexwp_plugin_basename = ' . var_export($plugin_basename, true) . ";\n"
+            . "    \$cortexwp_active_plugins = (array) get_option('active_plugins', []);\n"
+            . "    \$cortexwp_network_active = function_exists('is_multisite') && is_multisite()\n"
+            . "        && array_key_exists(\$cortexwp_plugin_basename, (array) get_site_option('active_sitewide_plugins', []));\n"
+            . "    if ((in_array(\$cortexwp_plugin_basename, \$cortexwp_active_plugins, true) || \$cortexwp_network_active)\n"
+            . "        && is_readable(\$cortexwp_connector)) {\n"
+            . "        \$GLOBALS['cortexwp_ai_early_fatal_connector'] = \$cortexwp_connector;\n"
+            . "        \$GLOBALS['cortexwp_ai_early_fatal_reserved_memory'] = str_repeat('x', 262144);\n"
+            . "        if (!function_exists('cortexwp_ai_early_fatal_capture_v2')) {\n"
+            . "            function cortexwp_ai_early_fatal_capture_v2(): void {\n"
+            . "                \$GLOBALS['cortexwp_ai_early_fatal_reserved_memory'] = '';\n"
+            . "                if (!empty(\$GLOBALS['cortexwp_ai_fatal_error_captured'])) {\n"
+            . "                    return;\n"
+            . "                }\n"
+            . "                if (!class_exists('CortexWP_AI_Connector', false)) {\n"
+            . "                    \$connector = (string) (\$GLOBALS['cortexwp_ai_early_fatal_connector'] ?? '');\n"
+            . "                    if (\$connector !== '' && empty(\$GLOBALS['cortexwp_ai_early_fatal_connector_attempted']) && is_readable(\$connector)) {\n"
+            . "                        \$GLOBALS['cortexwp_ai_early_fatal_connector_attempted'] = true;\n"
+            . "                        require_once \$connector;\n"
+            . "                    }\n"
+            . "                }\n"
+            . "                if (class_exists('CortexWP_AI_Connector', false)) {\n"
+            . "                    CortexWP_AI_Connector::capture_fatal_error();\n"
+            . "                }\n"
+            . "            }\n"
+            . "            register_shutdown_function('cortexwp_ai_early_fatal_capture_v2');\n"
+            . "        }\n"
+            . "        \$GLOBALS['cortexwp_ai_early_fatal_connector_attempted'] = true;\n"
+            . "        require_once \$cortexwp_connector;\n"
+            . "    }\n"
+            . "}\n";
     }
 
     private static function update_task_recovery_bridge_template_v3(): bool {
@@ -486,11 +620,16 @@ final class CortexWP_AI_Connector {
     public static function capture_fatal_error(): void {
         self::$reserved_memory = '';
 
+        if (!empty($GLOBALS['cortexwp_ai_fatal_error_captured'])) {
+            return;
+        }
+
         $error = error_get_last();
         if (!is_array($error) || !self::should_report_error($error)) {
             return;
         }
 
+        $GLOBALS['cortexwp_ai_fatal_error_captured'] = true;
         self::send_fatal_error(self::fatal_error_payload($error));
     }
 
@@ -527,10 +666,6 @@ final class CortexWP_AI_Connector {
     }
 
     private static function send_fatal_error(array $payload): void {
-        if (!function_exists('wp_remote_post')) {
-            return;
-        }
-
         $body = wp_json_encode($payload);
         if (!is_string($body) || $body === '') {
             return;
@@ -539,8 +674,7 @@ final class CortexWP_AI_Connector {
         $timestamp = (string) time();
         $nonce = bin2hex(random_bytes(16));
         $domain = self::key_domain();
-
-        wp_remote_post(self::fatal_error_endpoint(), [
+        $request = [
             'blocking' => false,
             'body' => $body,
             'headers' => [
@@ -553,7 +687,20 @@ final class CortexWP_AI_Connector {
             ],
             'redirection' => 0,
             'timeout' => 1,
-        ]);
+        ];
+
+        // wp_remote_post() is pluggable and is not loaded yet when a regular
+        // plugin fatals during wp-settings.php. WP_Http is loaded earlier.
+        if (function_exists('wp_remote_post')) {
+            $a = wp_remote_post(self::fatal_error_endpoint(), $request);
+        } elseif (class_exists('WP_Http')) {
+            $a = (new WP_Http())->post(self::fatal_error_endpoint(), $request);
+        } else {
+            error_log('CortexWP fatal reporter: WordPress HTTP transport is unavailable.');
+            return;
+        }
+
+        error_log( print_r( $a, true ) );
     }
 
     private static function fatal_error_signature(string $body, string $timestamp, string $nonce, string $domain): string {
@@ -6876,3 +7023,4 @@ PHP;
 }
 
 CortexWP_AI_Connector::boot();
+require_once __DIR__ . '/includes/class-cortexwp-health-endpoints.php';
