@@ -208,6 +208,9 @@ final class CortexWP_AI_Connector {
             '2.3.0-recovery-bridge-template-v3' => [
                 'callback' => 'update_task_recovery_bridge_template_v3',
             ],
+            '2.3.0-recovery-bridge-source-search-v1' => [
+                'callback' => 'update_task_recovery_bridge_source_search_v1',
+            ],
         ];
     }
 
@@ -317,6 +320,12 @@ final class CortexWP_AI_Connector {
         $status = self::ensure_recovery_bridge(false);
         return ($status['installed'] ?? false) === true
             && self::recovery_bridge_has_template_marker();
+    }
+
+    private static function update_task_recovery_bridge_source_search_v1(): bool {
+        $status = self::ensure_recovery_bridge(true);
+        return ($status['installed'] ?? false) === true
+            && self::recovery_bridge_has_source_search_marker();
     }
 
     public static function maybe_whitelist_service_ip(): void {
@@ -3361,6 +3370,12 @@ JS;
                 return rest_ensure_response(self::read_file((string) ($params['path'] ?? ''), (int) ($params['lines'] ?? 120), (int) ($params['max_output_bytes'] ?? 500000)));
             case 'list_directory':
                 return rest_ensure_response(self::list_directory((string) ($params['path'] ?? ABSPATH)));
+            case 'search_files':
+                return rest_ensure_response(self::search_files(
+                    (string) ($params['query'] ?? ''),
+                    (array) ($params['paths'] ?? []),
+                    (int) ($params['max_results'] ?? 80)
+                ));
             case 'php_environment':
                 return rest_ensure_response(self::php_environment());
             case 'inspect_path':
@@ -4593,6 +4608,77 @@ JS;
         return $backup_path;
     }
 
+    private static function search_files(string $query, array $paths, int $max_results) {
+        $query = trim($query);
+        if ($query === '') {
+            return new WP_Error('cortexwp_ai_search_query_required', 'A source search term is required.', ['status' => 400]);
+        }
+
+        $query = substr($query, 0, 200);
+        $max_results = max(1, min(120, $max_results));
+        $content_root = realpath(WP_CONTENT_DIR);
+        if (!$content_root || !is_dir($content_root)) {
+            return ['query' => $query, 'matches' => [], 'truncated' => false, 'error' => 'WordPress content directory was unavailable.'];
+        }
+
+        $roots = [];
+        foreach (array_slice($paths, 0, 8) as $requested_path) {
+            $candidate = self::safe_path((string) $requested_path);
+            if ($candidate && self::path_is_within($candidate, $content_root) && is_dir($candidate)) {
+                $roots[] = $candidate;
+            }
+        }
+        if (!$roots) {
+            $roots[] = $content_root;
+        }
+
+        $matches = [];
+        $seen = [];
+        try {
+            foreach ($roots as $root) {
+                $iterator = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)
+                );
+                foreach ($iterator as $file) {
+                    if (!$file instanceof SplFileInfo || !$file->isFile() || strtolower($file->getExtension()) !== 'php') {
+                        continue;
+                    }
+                    $real_file = realpath($file->getPathname());
+                    if (!$real_file || isset($seen[$real_file]) || $file->getSize() > 2 * 1024 * 1024) {
+                        continue;
+                    }
+                    $seen[$real_file] = true;
+                    $contents = @file_get_contents($real_file);
+                    if (!is_string($contents) || stripos($contents, $query) === false) {
+                        continue;
+                    }
+
+                    $matches[] = [
+                        'path' => self::public_site_path($real_file),
+                        'matched_query' => $query,
+                    ];
+                    if (count($matches) >= $max_results) {
+                        break 2;
+                    }
+                }
+            }
+        } catch (Throwable $error) {
+            return [
+                'query' => $query,
+                'matches' => $matches,
+                'truncated' => false,
+                'error' => 'The site could not complete the source search.',
+            ];
+        }
+
+        return [
+            'query' => $query,
+            'matches' => $matches,
+            'truncated' => count($matches) >= $max_results,
+            'searched_paths' => array_map([self::class, 'public_site_path'], $roots),
+        ];
+    }
+
     private static function replace_limited(string $contents, string $search, string $replace, int $limit): string {
         $result = '';
         $offset = 0;
@@ -5093,6 +5179,16 @@ JS;
         return is_string($contents) && strpos($contents, 'CORTEXWP_RECOVERY_TEMPLATE_V3') !== false;
     }
 
+    private static function recovery_bridge_has_source_search_marker(): bool {
+        $path = self::recovery_bridge_path();
+        if (!is_file($path) || !is_readable($path)) {
+            return false;
+        }
+
+        $contents = @file_get_contents($path);
+        return is_string($contents) && strpos($contents, 'CORTEXWP_RECOVERY_SOURCE_SEARCH_V1') !== false;
+    }
+
     private static function recovery_bridge_php(): string {
         $secret_export = var_export(self::recovery_secret(), true);
         $version_export = var_export(self::plugin_version(), true);
@@ -5103,6 +5199,7 @@ JS;
 declare(strict_types=1);
 
 // CORTEXWP_RECOVERY_TEMPLATE_V3
+// CORTEXWP_RECOVERY_SOURCE_SEARCH_V1
 
 define('CORTEXWP_RECOVERY_SECRET', %%SECRET%%);
 define('CORTEXWP_RECOVERY_VERSION', %%VERSION%%);
@@ -5534,6 +5631,80 @@ function cwp_list_directory(array $input): array {
     return ['path' => $dir, 'public_path' => cwp_public_path($dir), 'entries' => $entries, 'stderr' => '', 'exit_code' => 0, 'runner' => 'cortexwp-recovery-bridge'];
 }
 
+function cwp_search_files(array $input): array {
+    $query = trim((string) ($input['query'] ?? ''));
+    if ($query === '') {
+        cwp_fail('A source search term is required.', 400);
+    }
+
+    $query = substr($query, 0, 200);
+    $max_results = max(1, min(120, (int) ($input['max_results'] ?? 80)));
+    $content_root = realpath(CORTEXWP_RECOVERY_ROOT . DIRECTORY_SEPARATOR . 'wp-content');
+    if (!$content_root || !is_dir($content_root)) {
+        return ['query' => $query, 'matches' => [], 'truncated' => false, 'error' => 'WordPress content directory was unavailable.', 'runner' => 'cortexwp-recovery-bridge'];
+    }
+
+    $roots = [];
+    foreach (array_slice((array) ($input['paths'] ?? []), 0, 8) as $requested_path) {
+        $candidate = cwp_safe_path((string) $requested_path);
+        if ($candidate && cwp_is_listable_directory($candidate)) {
+            $roots[] = $candidate;
+        }
+    }
+    if (!$roots) {
+        $roots[] = $content_root;
+    }
+
+    $matches = [];
+    $seen = [];
+    try {
+        foreach ($roots as $root) {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)
+            );
+            foreach ($iterator as $file) {
+                if (!$file instanceof SplFileInfo || !$file->isFile() || strtolower($file->getExtension()) !== 'php' || !cwp_is_recoverable_php_file($file->getPathname())) {
+                    continue;
+                }
+                $real_file = realpath($file->getPathname());
+                if (!$real_file || isset($seen[$real_file]) || $file->getSize() > 2 * 1024 * 1024) {
+                    continue;
+                }
+                $seen[$real_file] = true;
+                $contents = @file_get_contents($real_file);
+                if (!is_string($contents) || stripos($contents, $query) === false) {
+                    continue;
+                }
+
+                $matches[] = [
+                    'path' => cwp_public_path($real_file),
+                    'matched_query' => $query,
+                ];
+                if (count($matches) >= $max_results) {
+                    break 2;
+                }
+            }
+        }
+    } catch (Throwable $error) {
+        return [
+            'query' => $query,
+            'matches' => $matches,
+            'truncated' => false,
+            'error' => 'The site could not complete the source search.',
+            'runner' => 'cortexwp-recovery-bridge',
+        ];
+    }
+
+    cwp_audit('search_files', ['query' => $query, 'matches' => count($matches)], 'succeeded');
+    return [
+        'query' => $query,
+        'matches' => $matches,
+        'truncated' => count($matches) >= $max_results,
+        'searched_paths' => array_map('cwp_public_path', $roots),
+        'runner' => 'cortexwp-recovery-bridge',
+    ];
+}
+
 function cwp_patch_file(array $input): array {
     $file = cwp_safe_path((string) ($input['path'] ?? ''));
     $search = (string) ($input['search'] ?? '');
@@ -5672,6 +5843,9 @@ try {
             break;
         case 'list_directory':
             cwp_response(cwp_list_directory($input));
+            break;
+        case 'search_files':
+            cwp_response(cwp_search_files($input));
             break;
         case 'patch_file':
             cwp_response(cwp_patch_file($input));
