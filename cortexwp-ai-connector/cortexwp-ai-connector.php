@@ -3464,9 +3464,101 @@ JS;
                     'theme_auto_updates' => [],
                     'core_security_updates_allowed' => $enabled,
                 ]);
+            case 'flyingpress_performance':
+                $result = self::flyingpress_performance((array) $params);
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
         }
 
         return new WP_Error('cortexwp_ai_unknown_action', 'Unknown CortexWP action.', ['status' => 400]);
+    }
+
+    private static function flyingpress_performance(array $params) {
+        if (!class_exists('FlyingPress\\Config') || !class_exists('FlyingPress\\Caching')) {
+            return new WP_Error('flyingpress_unavailable', 'FlyingPress is not active on this site.', ['status' => 409]);
+        }
+
+        $url = esc_url_raw((string) ($params['url'] ?? home_url('/')));
+        if (!$url || !preg_match('/^https?:\\/\\//i', $url)) {
+            return new WP_Error('flyingpress_invalid_url', 'A valid homepage URL is required.', ['status' => 400]);
+        }
+
+        $phase = sanitize_key((string) ($params['phase'] ?? 'probe'));
+        if ($phase === 'apply_config') {
+            // This is deliberately versioned and allowlisted. It changes only
+            // the performance controls CortexWP owns; credentials, CDN,
+            // cleanup, bloat, and object-cache settings remain untouched.
+            \FlyingPress\Config::update_config([
+                'vitals' => true,
+                'css_js_minify' => true,
+                'css_rucss' => true,
+                'js_delay' => true,
+                'js_delay_method' => 'background',
+                'js_delay_third_party' => true,
+                'js_delay_selected' => false,
+                'css_js_self_host_third_party' => true,
+                'lazy_load' => true,
+                'properly_size_images' => true,
+                'youtube_placeholder' => true,
+                'self_host_gravatars' => true,
+                'image_auto_optimize_uploads' => true,
+                'fonts_preload' => true,
+                'fonts_optimize_google' => true,
+                'fonts_display_swap' => true,
+                'lazy_render' => true,
+                'cache_link_prefetch' => true,
+                'cache_mobile' => true,
+            ]);
+        } elseif ($phase === 'fallback_defer') {
+            \FlyingPress\Config::update_config([
+                'js_delay' => true,
+                'js_delay_method' => 'defer',
+                'js_delay_third_party' => true,
+                'js_delay_selected' => false,
+                'cache_mobile' => true,
+            ]);
+        } elseif ($phase === 'purge_preload') {
+            if (!class_exists('FlyingPress\\Purge') || !class_exists('FlyingPress\\Preload')) {
+                return new WP_Error('flyingpress_cache_unavailable', 'FlyingPress cache controls are unavailable.', ['status' => 409]);
+            }
+            \FlyingPress\Purge::purge_urls([$url]);
+            \FlyingPress\Preload::preload_urls([$url], 11);
+        } elseif ($phase !== 'probe') {
+            return new WP_Error('flyingpress_invalid_phase', 'Unsupported FlyingPress performance phase.', ['status' => 400]);
+        }
+
+        return self::flyingpress_performance_probe($url);
+    }
+
+    private static function flyingpress_performance_probe(string $url): array {
+        $config = \FlyingPress\Config::$config;
+        $parsed = wp_parse_url($url);
+        $host = is_array($parsed) ? (string) ($parsed['host'] ?? '') : '';
+        $path = is_array($parsed) ? (string) ($parsed['path'] ?? '/') : '/';
+        $path = '/' . ltrim(urldecode($path), '/');
+        $cacheRoot = defined('FLYING_PRESS_CACHE_DIR') ? (string) FLYING_PRESS_CACHE_DIR : '';
+        $cacheDirectory = $cacheRoot && $host ? trailingslashit($cacheRoot . $host . $path) : '';
+        $desktopFile = $cacheDirectory . 'index.html.gz';
+        $mobileFile = $cacheDirectory . 'index-mobile.html.gz';
+        $files = [];
+        foreach (['desktop' => $desktopFile, 'mobile' => $mobileFile] as $device => $file) {
+            $files[$device] = [
+                'exists' => $file !== '' && is_file($file),
+                'updated_at' => $file !== '' && is_file($file) ? gmdate('c', (int) filemtime($file)) : null,
+                'name' => basename($file),
+            ];
+        }
+
+        return [
+            'available' => true,
+            'cacheable' => (bool) \FlyingPress\Caching::is_url_cacheable($url),
+            'cache_mobile' => !empty($config['cache_mobile']),
+            'cache_files' => $files,
+            'config' => [
+                'js_delay' => !empty($config['js_delay']),
+                'js_delay_method' => (string) ($config['js_delay_method'] ?? ''),
+                'cache_mobile' => !empty($config['cache_mobile']),
+            ],
+        ];
     }
 
     private static function normalize_component_type(string $type): string {
