@@ -19,3 +19,32 @@ The action allowlists performance settings and leaves license, CDN, cleanup,
 bloat, object-cache, credentials, and unrelated plugin settings untouched. Its
 probe returns bounded cacheability, cache-file existence/timestamps, and selected
 configuration state; it never returns absolute paths or secrets.
+
+## Performance speed-up actions (engine v2, connector 2.5)
+
+These actions back the AI speed-up on the CortexWP Performance page. Each one
+is allowlisted and bounded; older connectors answer "Unknown CortexWP action"
+and CortexWP falls back to the original `flyingpress_performance` flow.
+
+- `flyingpress_config` (`read` / `patch`): reads and changes only the FlyingPress
+  settings listed in `flyingpress_config_schema()` (optimization, bloat,
+  database clean-up, image format, and exclusion lists). Credentials, CDN,
+  Cloudflare, and license keys are never read or written. `patch` returns the
+  previous values so CortexWP can undo the change.
+- `performance_environment`: read-only theme, active plugins, page builders,
+  WooCommerce, PHP/object cache, FlyingPress license/CDN flags, and the managed
+  snippet's rules.
+- `performance_images`: `resolve` homepage image URLs to attachments,
+  `optimize` up to two attachments at a time with FlyingPress's own image
+  optimizer (no cache purge), `status` (cheap queue counts), `full_status`,
+  `optimize_all` (FlyingPress queues every image and clears/preloads the whole
+  cache itself when done), and `stop_all`.
+- `performance_db`: `stats` (counts) and `clean` (switches on FlyingPress's
+  weekly clean-up for the chosen items, runs it now when small; never optimizes
+  tables).
+- `performance_snippet` (`read` / `write`): the ONE managed snippet
+  `cortexwp-performance` ("CortexWP Performance"). It is regenerated from
+  validated rules stored in the `cortexwp_performance_rules` option. To add a
+  new performance fix, add a rule type to `performance_validate_rule()` and
+  `performance_snippet_rule_code()`; never create another snippet. Values are
+  embedded with `var_export` only, and jQuery can never be removed.

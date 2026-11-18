@@ -19,6 +19,7 @@ $option_names = [
     'cortexwp_ai_login_table_version',
     'cortexwp_ai_redirect_rules',
     'cortexwp_ai_site_health_cache_v2',
+    'cortexwp_performance_rules',
 ];
 
 foreach ($option_names as $option_name) {

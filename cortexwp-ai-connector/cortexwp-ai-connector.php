@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP - Manage WordPress with AI
  * Description: Securely connects your WordPress site with CortexWP.ai Dashboard.
- * Version: 2.4
+ * Version: 2.5
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -3475,6 +3475,20 @@ JS;
             case 'flyingpress_performance':
                 $result = self::flyingpress_performance((array) $params);
                 return is_wp_error($result) ? $result : rest_ensure_response($result);
+            case 'flyingpress_config':
+                $result = self::flyingpress_config_action((array) $params);
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
+            case 'performance_environment':
+                return rest_ensure_response(self::performance_environment());
+            case 'performance_images':
+                $result = self::performance_images_action((array) $params);
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
+            case 'performance_db':
+                $result = self::performance_db_action((array) $params);
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
+            case 'performance_snippet':
+                $result = self::performance_snippet_action((array) $params);
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
         }
 
         return new WP_Error('cortexwp_ai_unknown_action', 'Unknown CortexWP action.', ['status' => 400]);
@@ -3671,6 +3685,600 @@ JS;
                 'cache_mobile' => !empty($config['cache_mobile']),
             ],
         ];
+    }
+
+    // ---------------------------------------------------------------------
+    // CortexWP Performance (speed-up engine v2)
+    //
+    // Every action below is allowlisted and bounded. Settings changes return
+    // the previous values so CortexWP can undo them, and site-specific PHP
+    // fixes live in ONE managed snippet ("CortexWP Performance") that is
+    // regenerated from validated rules. Add new performance fixes as new rule
+    // types in performance_snippet_rule_code(); never create another snippet.
+    // ---------------------------------------------------------------------
+
+    private const PERFORMANCE_SNIPPET_SLUG = 'cortexwp-performance';
+    private const OPTION_PERFORMANCE_RULES = 'cortexwp_performance_rules';
+    private const PERFORMANCE_MAX_RULES = 30;
+
+    private static function flyingpress_loaded(): bool {
+        return class_exists('FlyingPress\\Config') && is_array(\FlyingPress\Config::$config);
+    }
+
+    private static function flyingpress_unavailable_error(): WP_Error {
+        return new WP_Error('flyingpress_unavailable', 'FlyingPress is not active on this site.', ['status' => 409]);
+    }
+
+    /** Settings CortexWP may read and change. Credentials are never listed. */
+    private static function flyingpress_config_schema(): array {
+        $bool = [
+            'vitals', 'css_js_minify', 'css_rucss', 'js_delay', 'js_delay_third_party', 'js_delay_selected',
+            'css_js_self_host_third_party', 'lazy_load', 'properly_size_images', 'youtube_placeholder',
+            'self_host_gravatars', 'image_auto_optimize_uploads', 'fonts_preload', 'fonts_optimize_google',
+            'fonts_display_swap', 'lazy_render', 'cache_link_prefetch', 'cache_mobile',
+            'bloat_disable_block_css', 'bloat_disable_dashicons', 'bloat_disable_emojis',
+            'bloat_disable_jquery_migrate', 'bloat_disable_oembeds', 'bloat_heartbeat_control',
+            'bloat_post_revisions_control', 'db_auto_clean', 'db_post_revisions', 'db_post_auto_drafts',
+            'db_post_trashed', 'db_comments_spam', 'db_comments_trashed', 'db_transients_expired',
+        ];
+        $schema = [];
+        foreach ($bool as $key) {
+            $schema[$key] = ['type' => 'bool'];
+        }
+        $schema['js_delay_method'] = ['type' => 'enum', 'values' => ['defer', 'background', 'user-interaction']];
+        $schema['image_format'] = ['type' => 'enum', 'values' => ['avif', 'webp', 'original']];
+        $schema['image_compression_type'] = ['type' => 'enum', 'values' => ['lossy', 'lossless']];
+        $schema['db_auto_clean_interval'] = ['type' => 'enum', 'values' => ['daily', 'weekly', 'monthly']];
+        foreach (['js_delay_excludes', 'js_delay_third_party_excludes', 'js_delay_selected_includes', 'lazy_load_exclusions', 'css_rucss_include_selectors', 'lazy_render_excludes'] as $key) {
+            $schema[$key] = ['type' => 'list'];
+        }
+
+        return $schema;
+    }
+
+    private static function flyingpress_allowlisted_config(): array {
+        $config = self::flyingpress_loaded() ? \FlyingPress\Config::$config : [];
+        $values = [];
+        foreach (self::flyingpress_config_schema() as $key => $rule) {
+            if (!array_key_exists($key, $config)) {
+                continue;
+            }
+            $value = $config[$key];
+            if ($rule['type'] === 'bool') {
+                $values[$key] = (bool) $value;
+            } elseif ($rule['type'] === 'enum') {
+                $values[$key] = (string) $value;
+            } else {
+                $values[$key] = array_values(array_slice(array_map('strval', (array) $value), 0, 100));
+            }
+        }
+
+        return $values;
+    }
+
+    private static function flyingpress_config_action(array $params) {
+        if (!self::flyingpress_loaded()) {
+            return self::flyingpress_unavailable_error();
+        }
+
+        $phase = sanitize_key((string) ($params['phase'] ?? 'read'));
+        if ($phase === 'read') {
+            return ['config' => self::flyingpress_allowlisted_config()];
+        }
+        if ($phase !== 'patch') {
+            return new WP_Error('flyingpress_invalid_phase', 'Unsupported FlyingPress settings phase.', ['status' => 400]);
+        }
+
+        $schema = self::flyingpress_config_schema();
+        $values = is_array($params['values'] ?? null) ? $params['values'] : [];
+        if (!$values || count($values) > 40) {
+            return new WP_Error('flyingpress_invalid_patch', 'Send between 1 and 40 FlyingPress settings.', ['status' => 400]);
+        }
+
+        $patch = [];
+        foreach ($values as $key => $value) {
+            $key = (string) $key;
+            if (!isset($schema[$key])) {
+                return new WP_Error('flyingpress_invalid_patch', 'This FlyingPress setting cannot be changed: ' . sanitize_key($key), ['status' => 400]);
+            }
+            $rule = $schema[$key];
+            if ($rule['type'] === 'bool') {
+                $patch[$key] = (bool) $value;
+            } elseif ($rule['type'] === 'enum') {
+                $value = (string) $value;
+                if (!in_array($value, $rule['values'], true)) {
+                    return new WP_Error('flyingpress_invalid_patch', 'Unsupported value for ' . $key . '.', ['status' => 400]);
+                }
+                $patch[$key] = $value;
+            } else {
+                $items = [];
+                foreach ((array) $value as $item) {
+                    $item = trim(sanitize_text_field((string) $item));
+                    if ($item !== '' && strlen($item) <= 300) {
+                        $items[] = $item;
+                    }
+                }
+                $patch[$key] = array_values(array_slice(array_unique($items), 0, 100));
+            }
+        }
+
+        $current = \FlyingPress\Config::$config;
+        $previous = [];
+        foreach ($patch as $key => $value) {
+            $previous[$key] = array_key_exists($key, $current) ? $current[$key] : null;
+        }
+        \FlyingPress\Config::update_config($patch);
+
+        return [
+            'previous' => $previous,
+            'config' => self::flyingpress_allowlisted_config(),
+        ];
+    }
+
+    /** Small read-only description of the site used for diagnosis. */
+    private static function performance_environment(): array {
+        if (!function_exists('get_plugins')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        $active = (array) get_option('active_plugins', []);
+        if (is_multisite()) {
+            $active = array_merge($active, array_keys((array) get_site_option('active_sitewide_plugins', [])));
+        }
+        $all = (array) get_plugins();
+        $plugins = [];
+        foreach (array_slice(array_unique($active), 0, 120) as $file) {
+            $data = $all[$file] ?? [];
+            $plugins[] = [
+                'slug' => strtolower((string) dirname((string) $file)) === '.' ? basename((string) $file, '.php') : strtolower((string) dirname((string) $file)),
+                'name' => substr(wp_strip_all_tags((string) ($data['Name'] ?? '')), 0, 80),
+                'version' => substr((string) ($data['Version'] ?? ''), 0, 20),
+            ];
+        }
+
+        $theme = wp_get_theme();
+        $parent = $theme->parent();
+        $slugs = array_column($plugins, 'slug');
+        $themeSlug = strtolower((string) $theme->get_stylesheet());
+        $templateSlug = strtolower((string) $theme->get_template());
+        $builders = [];
+        $builderMap = [
+            'elementor' => 'Elementor', 'bb-plugin' => 'Beaver Builder', 'beaver-builder-lite-version' => 'Beaver Builder',
+            'js_composer' => 'WPBakery', 'oxygen' => 'Oxygen', 'brizy' => 'Brizy', 'thrive-visual-editor' => 'Thrive Architect',
+            'siteorigin-panels' => 'SiteOrigin', 'breakdance' => 'Breakdance', 'fusion-builder' => 'Avada', 'kadence-blocks' => 'Kadence Blocks',
+            'spectra' => 'Spectra', 'ultimate-addons-for-gutenberg' => 'Spectra', 'generateblocks' => 'GenerateBlocks', 'revslider' => 'Slider Revolution',
+        ];
+        foreach ($builderMap as $slug => $label) {
+            if (in_array($slug, $slugs, true)) {
+                $builders[] = $label;
+            }
+        }
+        if (in_array($templateSlug, ['divi', 'extra'], true)) {
+            $builders[] = 'Divi';
+        }
+        if ($templateSlug === 'bricks') {
+            $builders[] = 'Bricks';
+        }
+
+        $fp = self::flyingpress_plugin();
+        $fpConfig = self::flyingpress_loaded() ? \FlyingPress\Config::$config : [];
+
+        return [
+            'wordpress_version' => get_bloginfo('version'),
+            'php_version' => PHP_VERSION,
+            'server_software' => substr(sanitize_text_field((string) ($_SERVER['SERVER_SOFTWARE'] ?? '')), 0, 80),
+            'object_cache' => (bool) wp_using_ext_object_cache(),
+            'redis_extension' => extension_loaded('redis'),
+            'home_url' => home_url('/'),
+            'show_on_front' => (string) get_option('show_on_front'),
+            'theme' => [
+                'slug' => $themeSlug,
+                'name' => substr((string) $theme->get('Name'), 0, 80),
+                'parent' => $parent ? strtolower((string) $parent->get_stylesheet()) : '',
+                'block_theme' => function_exists('wp_is_block_theme') ? (bool) wp_is_block_theme() : false,
+            ],
+            'plugins' => $plugins,
+            'woocommerce' => class_exists('WooCommerce'),
+            'builders' => array_values(array_unique($builders)),
+            'flyingpress' => [
+                'version' => $fp['version'],
+                'license_active' => !empty($fpConfig['license_active']),
+                'cdn' => !empty($fpConfig['cdn']),
+                'cloudflare' => (string) ($fpConfig['cf_status'] ?? '') === 'connected' || !empty($fpConfig['cf_page_caching']),
+                'object_cache' => !empty($fpConfig['object_cache']),
+            ],
+            'performance_snippet' => [
+                'rules' => self::performance_rules(),
+                'enabled' => self::performance_snippet_enabled(),
+            ],
+            'actions' => ['flyingpress_config', 'performance_images', 'performance_snippet', 'performance_db', 'performance_environment'],
+        ];
+    }
+
+    // --- Images ------------------------------------------------------------
+
+    private static function performance_attachment_id(string $url): int {
+        $url = strtok($url, '?#') ?: '';
+        if ($url === '') {
+            return 0;
+        }
+        $id = (int) attachment_url_to_postid($url);
+        if ($id) {
+            return $id;
+        }
+
+        // Resized copies ("photo-300x200.jpg"), scaled originals, and
+        // optimized formats point back to the same attachment.
+        $candidates = [];
+        $base = preg_replace('/-\d+x\d+(?=\.[a-z0-9]+$)/i', '', $url) ?? $url;
+        $candidates[] = $base;
+        $candidates[] = preg_replace('/(?=\.[a-z0-9]+$)/i', '-scaled', $base, 1) ?? $base;
+        foreach (array_values(array_unique($candidates)) as $candidate) {
+            foreach (['', 'jpg', 'jpeg', 'png'] as $ext) {
+                $try = $ext === '' ? $candidate : (preg_replace('/\.(avif|webp)$/i', '.' . $ext, $candidate) ?? $candidate);
+                if ($ext !== '' && $try === $candidate) {
+                    continue;
+                }
+                $id = (int) attachment_url_to_postid($try);
+                if ($id) {
+                    return $id;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    private static function performance_image_state(int $id): array {
+        $meta = (array) get_post_meta($id, 'flying_press_image_optimizer_data', true);
+        $metadata = (array) wp_get_attachment_metadata($id);
+        $original = is_array($meta['original_data'] ?? null) ? $meta['original_data'] : $metadata;
+        $size = static function (array $data): int {
+            $total = (int) ($data['filesize'] ?? 0);
+            foreach ((array) ($data['sizes'] ?? []) as $item) {
+                $total += (int) ($item['filesize'] ?? 0);
+            }
+            return $total;
+        };
+        $unoptimized = array_slice(array_map('strval', array_values((array) ($meta['sizes_unoptimized'] ?? []))), 0, 3);
+
+        return [
+            'id' => $id,
+            'mime' => (string) get_post_mime_type($id),
+            'optimized' => isset($meta['status']),
+            'original_bytes' => $size($original),
+            'current_bytes' => $size($metadata),
+            'errors' => array_map(static function ($message) {
+                return substr(wp_strip_all_tags((string) $message), 0, 160);
+            }, $unoptimized),
+        ];
+    }
+
+    private static function performance_images_action(array $params) {
+        if (!self::flyingpress_loaded() || !class_exists('FlyingPress\\ImageOptimizer')) {
+            return self::flyingpress_unavailable_error();
+        }
+
+        $phase = sanitize_key((string) ($params['phase'] ?? 'status'));
+
+        if ($phase === 'resolve') {
+            $items = [];
+            foreach (array_slice((array) ($params['urls'] ?? []), 0, 40) as $url) {
+                $url = esc_url_raw((string) $url);
+                if (!$url) {
+                    continue;
+                }
+                $id = self::performance_attachment_id($url);
+                $items[] = $id ? array_merge(['url' => $url], self::performance_image_state($id)) : ['url' => $url, 'id' => 0];
+            }
+            return ['images' => $items];
+        }
+
+        if ($phase === 'optimize') {
+            $format = (string) ($params['format'] ?? '');
+            if (!in_array($format, ['avif', 'webp', 'original'], true)) {
+                return new WP_Error('performance_images_invalid', 'Choose an image format.', ['status' => 400]);
+            }
+            $compression = in_array((string) ($params['compression'] ?? 'lossy'), ['lossy', 'lossless'], true) ? (string) $params['compression'] : 'lossy';
+            $config = \FlyingPress\Config::$config;
+            if (($config['image_format'] ?? '') !== $format || ($config['image_compression_type'] ?? '') !== $compression) {
+                \FlyingPress\Config::update_config(['image_format' => $format, 'image_compression_type' => $compression]);
+            }
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(170);
+            }
+            $results = [];
+            foreach (array_slice(array_map('intval', (array) ($params['ids'] ?? [])), 0, 2) as $id) {
+                if ($id <= 0 || get_post_type($id) !== 'attachment') {
+                    continue;
+                }
+                $state = self::performance_image_state($id);
+                if (!$state['optimized'] && in_array($state['mime'], ['image/jpeg', 'image/jpg', 'image/png'], true)) {
+                    // FlyingPress's own optimizer, one image at a time. It
+                    // does not clear the page cache; CortexWP does that.
+                    \FlyingPress\ImageOptimizer::optimize_single_image(['image_id' => $id]);
+                    clean_post_cache($id);
+                    $state = self::performance_image_state($id);
+                }
+                $results[] = $state;
+            }
+            return ['images' => $results];
+        }
+
+        if ($phase === 'status') {
+            $imageQueue = null;
+            if (class_exists('FlyingPress\\Queue') && method_exists('FlyingPress\\Queue', 'get_pending_count')) {
+                $imageQueue = (new \FlyingPress\Queue('image-optimize', 'flying_press_optimize_image', 3))->get_pending_count();
+            }
+            $preload = class_exists('FlyingPress\\Preload') && method_exists('FlyingPress\\Preload', 'get_remaining_tasks_count')
+                ? (int) \FlyingPress\Preload::get_remaining_tasks_count()
+                : null;
+            return [
+                'image_queue' => $imageQueue,
+                'preload_queue' => $preload,
+                'image_format' => (string) (\FlyingPress\Config::$config['image_format'] ?? ''),
+            ];
+        }
+
+        if ($phase === 'full_status') {
+            $status = (array) \FlyingPress\ImageOptimizer::get_status();
+            return ['status' => array_map('intval', array_intersect_key($status, array_flip(['total_images', 'processed_images', 'original_size', 'optimized_size', 'images_in_queue'])))];
+        }
+
+        if ($phase === 'optimize_all') {
+            // FlyingPress queues every remaining image and, when the queue
+            // finishes, clears and preloads the whole page cache itself.
+            $result = (array) \FlyingPress\ImageOptimizer::optimize_images();
+            return ['queued' => !empty($result['success'])];
+        }
+
+        if ($phase === 'stop_all') {
+            \FlyingPress\ImageOptimizer::stop_optimization();
+            return ['stopped' => true];
+        }
+
+        return new WP_Error('performance_images_invalid', 'Unsupported image phase.', ['status' => 400]);
+    }
+
+    // --- Database ----------------------------------------------------------
+
+    private static function performance_db_counts(): array {
+        global $wpdb;
+        return [
+            'db_post_revisions' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision'"),
+            'db_post_auto_drafts' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'auto-draft'"),
+            'db_post_trashed' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'trash'"),
+            'db_comments_spam' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->comments WHERE comment_approved = 'spam'"),
+            'db_comments_trashed' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->comments WHERE comment_approved IN ('trash', 'post-trashed')"),
+            'db_transients_expired' => (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $wpdb->options WHERE option_name LIKE %s AND option_value < %d",
+                $wpdb->esc_like('_transient_timeout') . '%',
+                time()
+            )),
+        ];
+    }
+
+    private static function performance_db_action(array $params) {
+        if (!self::flyingpress_loaded() || !class_exists('FlyingPress\\Database')) {
+            return self::flyingpress_unavailable_error();
+        }
+
+        $phase = sanitize_key((string) ($params['phase'] ?? 'stats'));
+        if ($phase === 'stats') {
+            return ['counts' => self::performance_db_counts()];
+        }
+        if ($phase !== 'clean') {
+            return new WP_Error('performance_db_invalid', 'Unsupported database phase.', ['status' => 400]);
+        }
+
+        $allowed = array_keys(self::performance_db_counts());
+        $items = array_values(array_intersect($allowed, array_map('strval', (array) ($params['items'] ?? []))));
+        if (!$items) {
+            return new WP_Error('performance_db_invalid', 'Choose what to clean.', ['status' => 400]);
+        }
+
+        // Keep the database tidy with FlyingPress's own weekly clean-up. Only
+        // the chosen items are switched on; table optimization is never used.
+        $patch = ['db_auto_clean' => true, 'db_auto_clean_interval' => 'weekly', 'db_optimize_tables' => false];
+        foreach ($allowed as $key) {
+            $patch[$key] = in_array($key, $items, true);
+        }
+        $previous = [];
+        foreach ($patch as $key => $value) {
+            $previous[$key] = \FlyingPress\Config::$config[$key] ?? null;
+        }
+        \FlyingPress\Config::update_config($patch);
+
+        $counts = self::performance_db_counts();
+        $pending = 0;
+        foreach ($items as $key) {
+            $pending += (int) ($counts[$key] ?? 0);
+        }
+        $mode = 'scheduled';
+        if ($pending <= 3000) {
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(170);
+            }
+            \FlyingPress\Database::clean();
+            $mode = 'now';
+        } elseif (!wp_next_scheduled('flying_press_clean_database')) {
+            wp_schedule_single_event(time() + 60, 'flying_press_clean_database');
+        }
+
+        return [
+            'mode' => $mode,
+            'previous' => $previous,
+            'counts' => self::performance_db_counts(),
+        ];
+    }
+
+    // --- The single performance snippet -----------------------------------
+
+    private static function performance_rules(): array {
+        $rules = get_option(self::OPTION_PERFORMANCE_RULES, []);
+        return is_array($rules) ? array_values($rules) : [];
+    }
+
+    private static function performance_snippet_enabled(): bool {
+        $snippet = self::get_snippet(self::PERFORMANCE_SNIPPET_SLUG);
+        return $snippet ? !empty($snippet['enabled']) : false;
+    }
+
+    /** Validates one rule; returns the normalized rule or a WP_Error. */
+    private static function performance_validate_rule(array $rule) {
+        $type = sanitize_key((string) ($rule['type'] ?? ''));
+        $params = is_array($rule['params'] ?? null) ? $rule['params'] : [];
+        $id = substr(sanitize_key((string) ($rule['id'] ?? '')), 0, 64);
+        $note = substr(sanitize_text_field((string) ($rule['note'] ?? '')), 0, 200);
+        if ($id === '') {
+            $id = $type . '-' . substr(md5(wp_json_encode($params)), 0, 8);
+        }
+        $clean = [];
+
+        switch ($type) {
+            case 'woo_cart_fragments_off':
+            case 'classic_global_styles_off':
+                break;
+            case 'remove_asset_on_home':
+                $match = trim((string) ($params['match'] ?? ''));
+                $kind = (string) ($params['kind'] ?? '');
+                if (!preg_match('#^[A-Za-z0-9/_\-.~%]{6,200}$#', $match) || !in_array($kind, ['script', 'style'], true)) {
+                    return new WP_Error('performance_rule_invalid', 'Invalid file to remove.', ['status' => 400]);
+                }
+                if (preg_match('#(^|/)(jquery(\.min)?\.js|jquery-core|wp-includes/js/jquery/jquery)#i', $match)) {
+                    return new WP_Error('performance_rule_invalid', 'jQuery cannot be removed.', ['status' => 400]);
+                }
+                $clean = ['match' => $match, 'kind' => $kind];
+                break;
+            case 'preconnect':
+                $origins = [];
+                foreach (array_slice((array) ($params['origins'] ?? []), 0, 6) as $origin) {
+                    $origin = strtolower(trim((string) $origin));
+                    if (preg_match('#^https://[a-z0-9.-]+(:\d{2,5})?$#', $origin)) {
+                        $origins[] = $origin;
+                    }
+                }
+                if (!$origins) {
+                    return new WP_Error('performance_rule_invalid', 'Invalid preconnect origin.', ['status' => 400]);
+                }
+                $clean = ['origins' => array_values(array_unique($origins))];
+                break;
+            case 'preload_home_image':
+                $url = esc_url_raw((string) ($params['url'] ?? ''));
+                if (!$url || !preg_match('#^https://#i', $url) || strlen($url) > 500) {
+                    return new WP_Error('performance_rule_invalid', 'Invalid image URL.', ['status' => 400]);
+                }
+                $clean = ['url' => $url];
+                break;
+            default:
+                return new WP_Error('performance_rule_invalid', 'Unknown performance rule.', ['status' => 400]);
+        }
+
+        return ['id' => $id, 'type' => $type, 'params' => $clean, 'note' => $note];
+    }
+
+    /** PHP for one rule. Values are embedded with var_export only. */
+    private static function performance_snippet_rule_code(array $rule): string {
+        $p = (array) ($rule['params'] ?? []);
+        $comment = '// Rule ' . preg_replace('/[^a-z0-9_\-]/', '', (string) $rule['id']) . ($rule['note'] !== '' ? ': ' . str_replace(["\r", "\n", '?>'], ' ', (string) $rule['note']) : '');
+
+        switch ((string) $rule['type']) {
+            case 'woo_cart_fragments_off':
+                $code = "add_action('wp_enqueue_scripts', static function () {\n"
+                    . "    if (is_admin() || !function_exists('is_cart') || is_cart() || is_checkout()) {\n        return;\n    }\n"
+                    . "    wp_dequeue_script('wc-cart-fragments');\n}, 100);";
+                break;
+            case 'classic_global_styles_off':
+                $code = "add_action('wp_enqueue_scripts', static function () {\n"
+                    . "    if (is_admin() || (function_exists('wp_is_block_theme') && wp_is_block_theme()) || !(is_front_page() || is_home())) {\n        return;\n    }\n"
+                    . "    wp_dequeue_style('global-styles');\n    wp_dequeue_style('classic-theme-styles');\n}, 100);";
+                break;
+            case 'remove_asset_on_home':
+                $filter = $p['kind'] === 'script' ? 'script_loader_tag' : 'style_loader_tag';
+                $code = "add_filter(" . var_export($filter, true) . ", static function (\$tag, \$handle = '', \$src = '') {\n"
+                    . "    if (is_admin() || !(is_front_page() || is_home())) {\n        return \$tag;\n    }\n"
+                    . "    return strpos((string) \$src, " . var_export((string) $p['match'], true) . ") !== false ? '' : \$tag;\n}, 100, 3);";
+                break;
+            case 'preconnect':
+                $code = "add_filter('wp_resource_hints', static function (\$urls, \$relation) {\n"
+                    . "    if (\$relation !== 'preconnect') {\n        return \$urls;\n    }\n"
+                    . "    foreach (" . var_export(array_values((array) $p['origins']), true) . " as \$origin) {\n        \$urls[] = ['href' => \$origin, 'crossorigin' => 'anonymous'];\n    }\n"
+                    . "    return \$urls;\n}, 10, 2);";
+                break;
+            case 'preload_home_image':
+                $code = "add_action('wp_head', static function () {\n"
+                    . "    if (is_admin() || !(is_front_page() || is_home())) {\n        return;\n    }\n"
+                    . "    echo '<link rel=\"preload\" as=\"image\" fetchpriority=\"high\" href=\"' . esc_url(" . var_export((string) $p['url'], true) . ") . '\" />' . \"\\n\";\n}, 1);";
+                break;
+            default:
+                return '';
+        }
+
+        return $comment . "\n" . $code . "\n";
+    }
+
+    private static function performance_snippet_write(array $rules) {
+        $normalized = [];
+        $seen = [];
+        foreach (array_slice($rules, 0, self::PERFORMANCE_MAX_RULES) as $rule) {
+            $valid = self::performance_validate_rule((array) $rule);
+            if (is_wp_error($valid)) {
+                return $valid;
+            }
+            if (isset($seen[$valid['id']])) {
+                continue;
+            }
+            $seen[$valid['id']] = true;
+            $normalized[] = $valid;
+        }
+
+        $previous = self::performance_rules();
+        if (!$normalized) {
+            delete_option(self::OPTION_PERFORMANCE_RULES);
+            $path = self::snippet_path(self::PERFORMANCE_SNIPPET_SLUG);
+            if (is_file($path) && !is_link($path)) {
+                self::delete_snippet(self::PERFORMANCE_SNIPPET_SLUG);
+            }
+            return ['previous' => $previous, 'rules' => [], 'enabled' => false];
+        }
+
+        $body = [
+            '<?php',
+            "if (!defined('ABSPATH')) {",
+            '    exit;',
+            '}',
+            '',
+            '// Speed fixes added by CortexWP Performance. CortexWP rebuilds this',
+            '// snippet when it changes a fix, so manual edits here are replaced.',
+            '',
+        ];
+        foreach ($normalized as $rule) {
+            $body[] = self::performance_snippet_rule_code($rule);
+        }
+
+        $result = self::save_snippet('CortexWP Performance', implode("\n", $body), [
+            'slug' => self::PERFORMANCE_SNIPPET_SLUG,
+            'enabled' => true,
+            'source' => 'performance',
+        ]);
+        if (is_wp_error($result)) {
+            return $result;
+        }
+        update_option(self::OPTION_PERFORMANCE_RULES, $normalized, false);
+
+        return ['previous' => $previous, 'rules' => $normalized, 'enabled' => true];
+    }
+
+    private static function performance_snippet_action(array $params) {
+        $phase = sanitize_key((string) ($params['phase'] ?? 'read'));
+        if ($phase === 'read') {
+            return ['rules' => self::performance_rules(), 'enabled' => self::performance_snippet_enabled()];
+        }
+        if ($phase === 'write') {
+            return self::performance_snippet_write(is_array($params['rules'] ?? null) ? $params['rules'] : []);
+        }
+
+        return new WP_Error('performance_rule_invalid', 'Unsupported snippet phase.', ['status' => 400]);
     }
 
     private static function normalize_component_type(string $type): string {
