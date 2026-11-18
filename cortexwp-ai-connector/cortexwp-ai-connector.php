@@ -3464,6 +3464,14 @@ JS;
                     'theme_auto_updates' => [],
                     'core_security_updates_allowed' => $enabled,
                 ]);
+            case 'flyingpress_status':
+                return rest_ensure_response(self::flyingpress_status());
+            case 'flyingpress_activate':
+                $result = self::flyingpress_activate();
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
+            case 'flyingpress_license_activate':
+                $result = self::flyingpress_license_activate((string) ($params['license_key'] ?? ''));
+                return is_wp_error($result) ? $result : rest_ensure_response($result);
             case 'flyingpress_performance':
                 $result = self::flyingpress_performance((array) $params);
                 return is_wp_error($result) ? $result : rest_ensure_response($result);
@@ -3522,11 +3530,115 @@ JS;
             }
             \FlyingPress\Purge::purge_urls([$url]);
             \FlyingPress\Preload::preload_urls([$url], 11);
+        } elseif ($phase === 'purge_all') {
+            // Applies the new settings to every page: clear all cached pages,
+            // warm the homepage first, then queue the rest of the site.
+            if (!class_exists('FlyingPress\\Purge') || !class_exists('FlyingPress\\Preload')) {
+                return new WP_Error('flyingpress_cache_unavailable', 'FlyingPress cache controls are unavailable.', ['status' => 409]);
+            }
+            if (method_exists('FlyingPress\\Purge', 'purge_everything')) {
+                \FlyingPress\Purge::purge_everything();
+            } else {
+                \FlyingPress\Purge::purge_pages();
+            }
+            if (method_exists('FlyingPress\\Preload', 'preload_cache')) {
+                \FlyingPress\Preload::preload_cache();
+            }
+            \FlyingPress\Preload::preload_urls([$url], 11);
         } elseif ($phase !== 'probe') {
             return new WP_Error('flyingpress_invalid_phase', 'Unsupported FlyingPress performance phase.', ['status' => 400]);
         }
 
         return self::flyingpress_performance_probe($url);
+    }
+
+    // Read-only install/activation check. It never loads or changes FlyingPress
+    // settings, so it works whether the plugin is missing, inactive, or active.
+    private static function flyingpress_plugin(): array {
+        if (!function_exists('get_plugins') || !function_exists('is_plugin_active') || !function_exists('activate_plugin')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        foreach ((array) get_plugins() as $file => $data) {
+            $folder = strtolower((string) dirname((string) $file));
+            $name = strtolower(trim((string) ($data['Name'] ?? '')));
+            if ($folder === 'flying-press' || $name === 'flyingpress') {
+                return ['file' => (string) $file, 'version' => (string) ($data['Version'] ?? '')];
+            }
+        }
+
+        return ['file' => '', 'version' => ''];
+    }
+
+    // Activates only the installed FlyingPress plugin. It never installs,
+    // updates, or changes any other plugin or FlyingPress setting.
+    private static function flyingpress_activate() {
+        $plugin = self::flyingpress_plugin();
+        if ($plugin['file'] === '') {
+            return new WP_Error('flyingpress_not_installed', 'FlyingPress is not installed on this site.', ['status' => 404]);
+        }
+
+        $isActive = is_plugin_active($plugin['file']) || (is_multisite() && is_plugin_active_for_network($plugin['file']));
+        if (!$isActive) {
+            $result = activate_plugin($plugin['file']);
+            if (is_wp_error($result)) {
+                return new WP_Error('flyingpress_activation_failed', 'FlyingPress could not be activated.', ['status' => 409]);
+            }
+        }
+
+        $status = self::flyingpress_status();
+        // The plugin's classes load on the next request; trust WordPress's
+        // active flag for the request that just activated it.
+        $status['active'] = is_plugin_active($plugin['file']) || (is_multisite() && is_plugin_active_for_network($plugin['file']));
+        return $status;
+    }
+
+    private static function flyingpress_status(): array {
+        $plugin = self::flyingpress_plugin();
+        $pluginFile = $plugin['file'];
+        $version = $plugin['version'];
+
+        $loaded = class_exists('FlyingPress\\Config') && class_exists('FlyingPress\\Caching');
+        $active = $pluginFile !== ''
+            ? (is_plugin_active($pluginFile) || (is_multisite() && is_plugin_active_for_network($pluginFile)))
+            : $loaded;
+
+        $config = $loaded && is_array(\FlyingPress\Config::$config) ? \FlyingPress\Config::$config : [];
+
+        return [
+            'installed' => $pluginFile !== '' || $loaded,
+            'active' => $active && $loaded,
+            'version' => $version !== '' ? $version : (defined('FLYING_PRESS_VERSION') ? (string) FLYING_PRESS_VERSION : ''),
+            // Never return the key itself, only whether it is activated.
+            'license_active' => !empty($config['license_active']),
+            'license_status' => sanitize_key((string) ($config['license_status'] ?? '')),
+            'upload_url' => admin_url('plugin-install.php?tab=upload'),
+            'plugins_url' => admin_url('plugins.php'),
+            'license_url' => admin_url('admin.php?page=flying-press'),
+        ];
+    }
+
+    // Activates a FlyingPress license key through FlyingPress's own licensing
+    // client. The key is passed through only; it is never logged or returned.
+    private static function flyingpress_license_activate(string $licenseKey) {
+        $licenseKey = trim($licenseKey);
+        if ($licenseKey === '' || strlen($licenseKey) > 200 || !preg_match('/^[A-Za-z0-9_-]+$/', $licenseKey)) {
+            return new WP_Error('flyingpress_license_invalid', 'That license key is not valid.', ['status' => 400]);
+        }
+        if (!class_exists('FlyingPress\\License') || !class_exists('FlyingPress\\Config')) {
+            return new WP_Error('flyingpress_unavailable', 'FlyingPress is not active on this site.', ['status' => 409]);
+        }
+
+        try {
+            if (method_exists('FlyingPress\\License', 'load_sdk')) {
+                \FlyingPress\License::load_sdk();
+            }
+            \FlyingPress\License::activate_license($licenseKey);
+        } catch (\Throwable $error) {
+            return new WP_Error('flyingpress_license_invalid', 'FlyingPress did not accept that license key.', ['status' => 409]);
+        }
+
+        return self::flyingpress_status();
     }
 
     private static function flyingpress_performance_probe(string $url): array {
