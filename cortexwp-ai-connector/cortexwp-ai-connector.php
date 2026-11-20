@@ -2,7 +2,7 @@
 /**
  * Plugin Name: CortexWP - Manage WordPress with AI
  * Description: Securely connects your WordPress site with CortexWP.ai Dashboard.
- * Version: 2.5
+ * Version: 2.6
  * Author: CortexWP
  * Author URI: https://cortexwp.ai
  * Plugin URI: https://cortexwp.ai
@@ -78,12 +78,15 @@ final class CortexWP_AI_Connector {
         add_action('admin_notices', [__CLASS__, 'admin_update_policy_notice']);
         add_action('send_headers', [__CLASS__, 'send_security_headers'], 1);
         add_action('template_redirect', [__CLASS__, 'maybe_redirect_request'], 0);
+        add_action('template_redirect', [__CLASS__, 'maybe_handle_admin_login'], -1);
         add_action('template_redirect', [__CLASS__, 'maybe_block_author_enumeration'], 1);
         add_action('rest_api_init', [__CLASS__, 'register_routes']);
         add_action('rest_api_init', ['CortexWP_Health_Endpoints', 'register_routes']);
         add_action('wp_login', [__CLASS__, 'log_successful_login'], 10, 2);
         add_action('wp_login_failed', [__CLASS__, 'log_failed_login'], 10, 1);
         add_filter('authenticate', [__CLASS__, 'maybe_rate_limit_login'], 20, 3);
+        add_filter('wp_authenticate_user', [__CLASS__, 'block_cortexwp_admin_password_login'], 99, 2);
+        add_filter('wp_is_application_passwords_available_for_user', [__CLASS__, 'block_cortexwp_admin_application_passwords'], 99, 2);
         add_filter('login_errors', [__CLASS__, 'mask_login_errors']);
         add_filter('rest_authentication_errors', [__CLASS__, 'block_rest_user_listing']);
         add_filter('the_generator', [__CLASS__, 'hide_wordpress_generator'], 99);
@@ -857,6 +860,21 @@ final class CortexWP_AI_Connector {
         return self::hardening_enabled('disable_application_passwords') ? false : $available;
     }
 
+    public static function block_cortexwp_admin_application_passwords(bool $available, WP_User $user): bool {
+        return self::is_cortexwp_admin($user) ? false : $available;
+    }
+
+    public static function block_cortexwp_admin_password_login($user, string $password) {
+        if ($user instanceof WP_User && self::is_cortexwp_admin($user)) {
+            return new WP_Error(
+                'cortexwp_admin_password_disabled',
+                __('This account can only be opened from CortexWP.', 'cortexwp-ai')
+            );
+        }
+
+        return $user;
+    }
+
     public static function block_file_editor_caps(array $caps, ?string $cap, int $user_id, array $args): array {
         // Some WordPress/plugin call paths can pass a null meta capability.
         // Preserve the mapped capabilities instead of failing on the type declaration.
@@ -1161,6 +1179,86 @@ final class CortexWP_AI_Connector {
             'cleared' => true,
             'deleted' => $deleted,
         ];
+    }
+
+    private static function is_cortexwp_admin(WP_User $user): bool {
+        return get_user_meta($user->ID, 'cortexwp_managed_admin', true) === '1';
+    }
+
+    private static function ensure_cortexwp_admin(int $hinted_user_id = 0): array {
+        $user = $hinted_user_id > 0 ? get_user_by('id', $hinted_user_id) : false;
+        if (!$user instanceof WP_User || !self::is_cortexwp_admin($user)) {
+            $users = get_users([
+                'number' => 1,
+                'fields' => 'all',
+                'meta_key' => 'cortexwp_managed_admin',
+                'meta_value' => '1',
+            ]);
+            $user = $users[0] ?? false;
+        }
+
+        $created = false;
+        if (!$user instanceof WP_User) {
+            $login = 'cortexwp_admin';
+            if (get_user_by('login', $login)) {
+                $login .= '_' . substr(hash('sha256', self::current_domain()), 0, 10);
+            }
+            $user_id = wp_insert_user([
+                'user_login' => $login,
+                'user_pass' => wp_generate_password(64, true, true),
+                'user_email' => 'support@cortexwp.ai',
+                'display_name' => 'CortexWP',
+                'role' => 'administrator',
+                'show_admin_bar_front' => 'false',
+            ]);
+            if (is_wp_error($user_id)) return ['error' => 'The CortexWP administrator could not be created.'];
+            $user = get_user_by('id', (int) $user_id);
+            $created = true;
+        }
+
+        if (!$user instanceof WP_User) return ['error' => 'The CortexWP administrator could not be created.'];
+        update_user_meta($user->ID, 'cortexwp_managed_admin', '1');
+        update_user_meta($user->ID, 'cortexwp_managed_admin_domain', self::current_domain());
+        $user->set_role('administrator');
+
+        return ['user_id' => (int) $user->ID, 'created' => $created];
+    }
+
+    private static function create_cortexwp_admin_ticket(int $user_id): array {
+        $user = get_user_by('id', $user_id);
+        if (!$user instanceof WP_User || !self::is_cortexwp_admin($user) || !user_can($user, 'manage_options')) {
+            return ['error' => 'The CortexWP administrator is unavailable.'];
+        }
+
+        try {
+            $token = bin2hex(random_bytes(32));
+        } catch (Throwable $error) {
+            return ['error' => 'Secure sign-in is temporarily unavailable.'];
+        }
+        set_transient('cortexwp_admin_ticket_' . hash('sha256', $token), ['user_id' => $user_id], MINUTE_IN_SECONDS);
+
+        return ['login_url' => add_query_arg('cortexwp_admin_ticket', $token, home_url('/'))];
+    }
+
+    public static function maybe_handle_admin_login(): void {
+        $token = isset($_GET['cortexwp_admin_ticket']) ? sanitize_text_field(wp_unslash($_GET['cortexwp_admin_ticket'])) : '';
+        if ($token === '' || !preg_match('/^[a-f0-9]{64}$/', $token)) return;
+
+        $key = 'cortexwp_admin_ticket_' . hash('sha256', $token);
+        $ticket = get_transient($key);
+        delete_transient($key);
+        if (!is_array($ticket)) {
+            wp_die(esc_html__('This sign-in link has expired. Return to CortexWP and try again.', 'cortexwp-ai'), esc_html__('Sign-in unavailable', 'cortexwp-ai'), ['response' => 403]);
+        }
+        $user = get_user_by('id', (int) ($ticket['user_id'] ?? 0));
+        if (!$user instanceof WP_User || !self::is_cortexwp_admin($user) || !user_can($user, 'manage_options')) {
+            wp_die(esc_html__('This sign-in is no longer available. Return to CortexWP and try again.', 'cortexwp-ai'), esc_html__('Sign-in unavailable', 'cortexwp-ai'), ['response' => 403]);
+        }
+        nocache_headers();
+        wp_set_auth_cookie($user->ID, false, is_ssl());
+        self::log_successful_login($user->user_login, $user);
+        wp_safe_redirect(admin_url());
+        exit;
     }
 
     private static function security_check(string $id, string $status, string $title, string $description, array $meta = []): array {
@@ -3449,6 +3547,12 @@ JS;
                 return rest_ensure_response(self::security_login_events((array) ($params['filters'] ?? $params)));
             case 'security_login_events_clear':
                 return rest_ensure_response(self::clear_security_login_events());
+            case 'cortexwp_admin_ensure':
+                return rest_ensure_response(self::ensure_cortexwp_admin((int) ($params['user_id'] ?? 0)));
+            case 'cortexwp_admin_access':
+                $access = self::ensure_cortexwp_admin((int) ($params['user_id'] ?? 0));
+                $ticket = self::create_cortexwp_admin_ticket((int) ($access['user_id'] ?? 0));
+                return rest_ensure_response(array_merge($access, $ticket));
             case 'autopilot_update_policy':
                 $enabled = !empty($params['enabled']);
                 update_option(self::OPTION_AUTOPILOT_MANAGED, $enabled, false);
